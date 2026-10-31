@@ -109,48 +109,73 @@ pipeline {
         }
 
         // ── Stage 3: SonarQube Analysis ───────────────────────────────────
-        // Runs after tests so JaCoCo XML report already exists.
-        // qualitygate.wait=true blocks until SonarQube returns a result.
-        // Pipeline fails if quality gate is not met.
         stage('SonarQube Analysis') {
             when { expression { !params.SKIP_SONAR } }
             steps {
-                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                script {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                        parallel(
+                            'sonar-user-service': {
+                                dir('smartbiz-erp/backend/user-service') {
+                                    sh """
+                                        mvn sonar:sonar \
+                                          -Dsonar.host.url=${SONAR_HOST} \
+                                          -Dsonar.token=${SONAR_TOKEN} \
+                                          -Dsonar.projectKey=smartbiz-erp \
+                                          -Dsonar.qualitygate.wait=false \
+                                          -B -q
+                                    """
+                                }
+                            },
+                            'sonar-inventory-service': {
+                                dir('smartbiz-erp/backend/inventory-service') {
+                                    sh """
+                                        mvn sonar:sonar \
+                                          -Dsonar.host.url=${SONAR_HOST} \
+                                          -Dsonar.token=${SONAR_TOKEN} \
+                                          -Dsonar.projectKey=smartbiz-erp \
+                                          -Dsonar.qualitygate.wait=false \
+                                          -B -q
+                                    """
+                                }
+                            },
+                            'sonar-sales-service': {
+                                dir('smartbiz-erp/backend/sales-service') {
+                                    sh """
+                                        mvn sonar:sonar \
+                                          -Dsonar.host.url=${SONAR_HOST} \
+                                          -Dsonar.token=${SONAR_TOKEN} \
+                                          -Dsonar.projectKey=smartbiz-erp \
+                                          -Dsonar.qualitygate.wait=false \
+                                          -B -q
+                                    """
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Stage 4: Build JARs ───────────────────────────────────────────
+        stage('Build JARs') {
+            steps {
+                echo "===== Stage 4: Package fat JARs ====="
+                script {
                     parallel(
-                        'sonar-user-service': {
+                        'build-user': {
                             dir('smartbiz-erp/backend/user-service') {
-                                sh """
-                                    mvn sonar:sonar \
-                                      -Dsonar.host.url=${SONAR_HOST} \
-                                      -Dsonar.token=${SONAR_TOKEN} \
-                                      -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=false \
-                                      -B -q
-                                """
+                                sh 'mvn package -DskipTests -B -q'
                             }
                         },
-                        'sonar-inventory-service': {
+                        'build-inventory': {
                             dir('smartbiz-erp/backend/inventory-service') {
-                                sh """
-                                    mvn sonar:sonar \
-                                      -Dsonar.host.url=${SONAR_HOST} \
-                                      -Dsonar.token=${SONAR_TOKEN} \
-                                      -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=false \
-                                      -B -q
-                                """
+                                sh 'mvn package -DskipTests -B -q'
                             }
                         },
-                        'sonar-sales-service': {
+                        'build-sales': {
                             dir('smartbiz-erp/backend/sales-service') {
-                                sh """
-                                    mvn sonar:sonar \
-                                      -Dsonar.host.url=${SONAR_HOST} \
-                                      -Dsonar.token=${SONAR_TOKEN} \
-                                      -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=false \
-                                      -B -q
-                                """
+                                sh 'mvn package -DskipTests -B -q'
                             }
                         }
                     )
@@ -158,22 +183,7 @@ pipeline {
             }
         }
 
-        // ── Stage 4: Build JARs ───────────────────────────────────────────
-        // Tests already ran in Stage 2 — skip here to save time.
-        stage('Build JARs') {
-            steps {
-                echo "===== Stage 4: Package fat JARs ====="
-                parallel(
-                    'build-user':      { dir('smartbiz-erp/backend/user-service')      { sh 'mvn package -DskipTests -B -q' } },
-                    'build-inventory': { dir('smartbiz-erp/backend/inventory-service') { sh 'mvn package -DskipTests -B -q' } },
-                    'build-sales':     { dir('smartbiz-erp/backend/sales-service')     { sh 'mvn package -DskipTests -B -q' } }
-                )
-            }
-        }
-
         // ── Stage 5: Docker Build & Push to ECR ──────────────────────────
-        // Authenticates to ECR, builds each image, tags with env+buildNumber
-        // and env-latest, then pushes both tags.
         stage('Docker Build & Push') {
             steps {
                 echo "===== Stage 5: Build Docker images and push to ECR ====="
@@ -182,41 +192,43 @@ pipeline {
                         aws ecr get-login-password --region ${AWS_REGION} | \
                           docker login --username AWS --password-stdin ${ECR_REGISTRY}
                     """
-                    parallel(
-                        'push-user': {
-                            dir('smartbiz-erp/backend/user-service') {
-                                sh """
-                                    docker build -t ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} .
-                                    docker push ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
-                                    docker tag  ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} \
-                                                ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
-                                    docker push ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
-                                """
+                    script {
+                        parallel(
+                            'push-user': {
+                                dir('smartbiz-erp/backend/user-service') {
+                                    sh """
+                                        docker build -t ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} .
+                                        docker push ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
+                                        docker tag  ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} \
+                                                    ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                        docker push ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                    """
+                                }
+                            },
+                            'push-inventory': {
+                                dir('smartbiz-erp/backend/inventory-service') {
+                                    sh """
+                                        docker build -t ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} .
+                                        docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
+                                        docker tag  ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} \
+                                                    ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                        docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                    """
+                                }
+                            },
+                            'push-sales': {
+                                dir('smartbiz-erp/backend/sales-service') {
+                                    sh """
+                                        docker build -t ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} .
+                                        docker push ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
+                                        docker tag  ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} \
+                                                    ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                        docker push ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                    """
+                                }
                             }
-                        },
-                        'push-inventory': {
-                            dir('smartbiz-erp/backend/inventory-service') {
-                                sh """
-                                    docker build -t ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} .
-                                    docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
-                                    docker tag  ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} \
-                                                ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
-                                    docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
-                                """
-                            }
-                        },
-                        'push-sales': {
-                            dir('smartbiz-erp/backend/sales-service') {
-                                sh """
-                                    docker build -t ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} .
-                                    docker push ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
-                                    docker tag  ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} \
-                                                ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
-                                    docker push ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
-                                """
-                            }
-                        }
-                    )
+                        )
+                    }
                 }
             }
         }
