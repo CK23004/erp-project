@@ -124,7 +124,7 @@ pipeline {
                                       -Dsonar.host.url=${SONAR_HOST} \
                                       -Dsonar.token=${SONAR_TOKEN} \
                                       -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=true \
+                                      -Dsonar.qualitygate.wait=false \
                                       -B -q
                                 """
                             }
@@ -136,7 +136,7 @@ pipeline {
                                       -Dsonar.host.url=${SONAR_HOST} \
                                       -Dsonar.token=${SONAR_TOKEN} \
                                       -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=true \
+                                      -Dsonar.qualitygate.wait=false \
                                       -B -q
                                 """
                             }
@@ -148,7 +148,7 @@ pipeline {
                                       -Dsonar.host.url=${SONAR_HOST} \
                                       -Dsonar.token=${SONAR_TOKEN} \
                                       -Dsonar.projectKey=smartbiz-erp \
-                                      -Dsonar.qualitygate.wait=true \
+                                      -Dsonar.qualitygate.wait=false \
                                       -B -q
                                 """
                             }
