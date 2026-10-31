@@ -1,0 +1,21 @@
+# Generate JWT secret
+JWT_KEY=$(openssl rand -base64 32)
+echo "Save this JWT key: $JWT_KEY"
+
+# Create namespace first
+kubectl apply -f smartbiz-erp/k8s/namespace.yaml
+
+# Create the secret — replace URIs with your Atlas connection strings
+kubectl create secret generic smartbiz-secrets \
+  --namespace=smartbiz \
+  --from-literal=JWT_SECRET="$JWT_KEY" \
+  --from-literal=MONGO_URI_USERS="mongodb+srv://smartbiz-user:smartbiz-pass@smartbiz-db.6husght.mongodb.net/smartbiz_users?retryWrites=true&w=majority" \
+  --from-literal=MONGO_URI_INVENTORY="mongodb+srv://smartbiz-user:smartbiz-pass@smartbiz-db.6husght.mongodb.net/smartbiz_inventory?retryWrites=true&w=majority" \
+  --from-literal=MONGO_URI_SALES="mongodb+srv://smartbiz-user:smartbiz-pass@smartbiz-db.6husght.mongodb.net/smartbiz_sales?retryWrites=true&w=majority"
+
+
+
+sonar token : sqp_ecc13d116cff3e53e0e48d700431dbd04ed12237
+sonar key : smartbiz-erp
+
+JWT_KEY = 8ySPPbcdiVx8YzoUR7WNtpmMpu9CC00bxout86hEiI4=
