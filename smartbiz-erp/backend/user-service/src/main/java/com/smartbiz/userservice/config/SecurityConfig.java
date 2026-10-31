@@ -54,16 +54,13 @@ public class SecurityConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
 
-        // Allow both Vite dev server and the Docker/Nginx production origin.
-        // When running locally: npm run dev serves on :5173
-        // When running via Docker: Nginx serves on :80
-        config.setAllowedOrigins(List.of(
-            "http://localhost:5173",   // local dev (Vite)
-            "http://localhost",        // Docker (Nginx on port 80)
-            "http://localhost:80",     // explicit port 80
-            "https://example.com",     // production frontend
-            "https://www.example.com"  // production frontend www
-        ));
+        // allowedOriginPatterns supports wildcards and works with allowCredentials=true.
+        // This covers all deployment modes:
+        //   localhost:5173   → local Vite dev server
+        //   localhost        → Docker Nginx
+        //   *.cloudfront.net → no-domain CloudFront URL (changes per environment)
+        //   example.com      → custom domain (when configured)
+        config.setAllowedOriginPatterns(List.of("*"));
 
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
 

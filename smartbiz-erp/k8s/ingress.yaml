@@ -1,27 +1,19 @@
 # ── ALB Ingress ────────────────────────────────────────────────────────────
-# Routes external HTTPS traffic from api.example.com to all three backend
-# services via path-based routing.
+# Two modes — switch by commenting/uncommenting the relevant sections.
 #
-# Domain layout:
-#   example.com          → React frontend (S3 + CloudFront, managed by infra/frontend)
-#   api.example.com      → This ingress → ALB → EKS services
+# ── MODE A: No custom domain (default) ────────────────────────────────────
+#   Backend URL: http://<alb-dns>.us-east-1.elb.amazonaws.com
+#   No ACM cert, no Route53, no host rule.
+#   Use this for quick deploys or when you don't have a domain.
+#   To use: keep the spec.rules section WITHOUT a host field (see below).
 #
-# Prerequisites:
-#   1. AWS Load Balancer Controller installed on the cluster:
-#        helm repo add eks https://aws.github.io/eks-charts
-#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-#          -n kube-system --set clusterName=<cluster-name>
+# ── MODE B: Custom domain (api.example.com) ───────────────────────────────
+#   Backend URL: https://api.example.com
+#   Requires: ACM cert ARN, Route53 A alias record (manual one-time setup).
+#   To use: uncomment the certificate-arn, listen-ports, ssl-redirect
+#           annotations, and add host: api.example.com to spec.rules.
 #
-#   2. ACM certificate for api.example.com in us-east-1.
-#      Replace REPLACE_WITH_ACM_CERT_ARN below with the real ARN.
-#      Create the cert and DNS-validate it via ACM console or CLI.
-#
-#   3. Route53 A alias record:
-#        api.example.com  →  ALB DNS name (created after first ingress apply)
-#        Get ALB DNS: kubectl get ingress smartbiz-ingress -n smartbiz
-#        Then add Route53 alias in console or via Terraform.
-#
-# Path routing:
+# Path routing (same for both modes):
 #   /api/auth/*         → user-service
 #   /api/users/*        → user-service
 #   /api/employees/*    → user-service
@@ -35,6 +27,11 @@
 #   /api/orders/*       → sales-service
 #   /api/invoices/*     → sales-service
 #   /api/payments/*     → sales-service
+#
+# Prerequisite: AWS Load Balancer Controller must be installed on the cluster.
+#   helm repo add eks https://aws.github.io/eks-charts
+#   helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#     -n kube-system --set clusterName=<cluster-name>
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -42,22 +39,9 @@ metadata:
   name: smartbiz-ingress
   namespace: smartbiz
   annotations:
-    # Use the AWS Load Balancer Controller
     kubernetes.io/ingress.class: alb
-
-    # Internet-facing ALB — accessible from outside the VPC
     alb.ingress.kubernetes.io/scheme: internet-facing
-
-    # IP target type — routes directly to pod IPs (required for Fargate / recommended for EKS)
     alb.ingress.kubernetes.io/target-type: ip
-
-    # ACM certificate for api.example.com — HTTPS on port 443
-    # Replace with your actual ACM certificate ARN
-    alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
-
-    # Redirect HTTP → HTTPS at the ALB level
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
-    alb.ingress.kubernetes.io/ssl-redirect: "443"
 
     # Health check — all services expose /actuator/health
     alb.ingress.kubernetes.io/healthcheck-path: /actuator/health
@@ -68,19 +52,36 @@ metadata:
     # Security — drop malformed headers
     alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true
 
-    # CORS — allow requests from the frontend domain
-    alb.ingress.kubernetes.io/cors-allow-origin: "https://example.com,https://www.example.com"
-    alb.ingress.kubernetes.io/cors-allow-methods: "GET,POST,PUT,DELETE,OPTIONS"
-    alb.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,Accept,Origin"
+    # ── MODE A: HTTP only (no domain, no cert) — ACTIVE BY DEFAULT ────────
+    # ALB listens on port 80 only. Access backend via:
+    #   http://<alb-dns>.us-east-1.elb.amazonaws.com/api/...
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # ── MODE B: HTTPS + custom domain — uncomment to enable ───────────────
+    # 1. Replace REPLACE_WITH_ACM_CERT_ARN with your cert ARN
+    # 2. Uncomment the three lines below
+    # 3. Add "host: api.example.com" in spec.rules (see commented block)
+    # 4. Create Route53 A alias: api.example.com → ALB DNS name
+    #
+    # alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    # alb.ingress.kubernetes.io/ssl-redirect: "443"
 
 spec:
   rules:
-    # All backend APIs are served under api.example.com
-    - host: api.example.com
-      http:
+    # ── MODE A: No host rule — ALB accepts requests on any hostname ────────
+    # Access via the raw ALB DNS name on port 80.
+    # Run: kubectl get ingress smartbiz-ingress -n smartbiz
+    # to get the ALB ADDRESS after applying.
+    - http:
         paths:
 
-          # ── User Service ──────────────────────────────────────────────
+    # ── MODE B: Custom domain — replace the rule above with this ──────────
+    # - host: api.example.com
+    #   http:
+    #     paths:
+
+          # ── User Service ────────────────────────────────────────────────
           - path: /api/auth
             pathType: Prefix
             backend:
@@ -110,7 +111,7 @@ spec:
                 port:
                   number: 80
 
-          # ── Inventory Service ─────────────────────────────────────────
+          # ── Inventory Service ───────────────────────────────────────────
           - path: /api/products
             pathType: Prefix
             backend:
@@ -147,7 +148,7 @@ spec:
                 port:
                   number: 80
 
-          # ── Sales Service ─────────────────────────────────────────────
+          # ── Sales Service ───────────────────────────────────────────────
           - path: /api/customers
             pathType: Prefix
             backend:

@@ -42,13 +42,7 @@ public class SecurityConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
 
-        config.setAllowedOrigins(List.of(
-            "http://localhost:5173",   // local dev (Vite)
-            "http://localhost",        // Docker (Nginx on port 80)
-            "http://localhost:80",     // explicit port 80
-            "https://example.com",     // production frontend
-            "https://www.example.com"  // production frontend www
-        ));
+        config.setAllowedOriginPatterns(List.of("*"));
 
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
 

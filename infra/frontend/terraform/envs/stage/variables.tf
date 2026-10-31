@@ -1,26 +1,29 @@
 # ── Stage Frontend — Variable Declarations ────────────────────────────────
 
 variable "aws_region" {
-  description = "Primary AWS region for S3 and Route53"
-  type        = string
+  type = string
 }
 
 variable "environment" {
-  description = "Environment label — dev / stage / prod"
-  type        = string
+  type = string
 }
 
 variable "bucket_name" {
-  description = "Globally unique S3 bucket name for frontend static files"
-  type        = string
+  type = string
+}
+
+variable "use_custom_domain" {
+  description = "false = *.cloudfront.net URL. true = custom domain + ACM + Route53."
+  type        = bool
+  default     = false
 }
 
 variable "domain_name" {
-  description = "Custom domain for this environment (e.g. stage.erp.example.com)"
-  type        = string
+  type    = string
+  default = ""
 }
 
 variable "hosted_zone_id" {
-  description = "Route53 hosted zone ID for the root domain"
-  type        = string
+  type    = string
+  default = ""
 }

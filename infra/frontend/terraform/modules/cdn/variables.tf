@@ -15,17 +15,27 @@ variable "bucket_name" {
   type        = string
 }
 
+# ── Custom domain variables — only required when use_custom_domain = true ──
+variable "use_custom_domain" {
+  description = "Set to true to use a custom domain + ACM cert. Set to false to use the default *.cloudfront.net URL (no domain, no cert needed)."
+  type        = bool
+  default     = false
+}
+
 variable "domain_name" {
-  description = "Custom domain for the CloudFront distribution (e.g. dev.erp.example.com)"
+  description = "Custom domain for the CloudFront distribution. Only used when use_custom_domain = true."
   type        = string
+  default     = ""
 }
 
 variable "certificate_arn" {
-  description = "ACM certificate ARN (must be in us-east-1) — from acm module output"
+  description = "ACM certificate ARN (must be in us-east-1). Only used when use_custom_domain = true."
   type        = string
+  default     = ""
 }
 
 variable "hosted_zone_id" {
-  description = "Route53 hosted zone ID — used to create the A alias record pointing to CloudFront"
+  description = "Route53 hosted zone ID. Only used when use_custom_domain = true."
   type        = string
+  default     = ""
 }

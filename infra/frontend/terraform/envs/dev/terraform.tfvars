@@ -1,10 +1,22 @@
 # ── Dev Frontend — Variable Values ───────────────────────────────────────
-# Replace hosted_zone_id with your actual Route53 hosted zone ID.
-# The hosted zone must already exist (created manually or via a separate
-# Terraform run) before applying this configuration.
+# MODE: no custom domain — frontend served from *.cloudfront.net URL
+# After apply, run: terraform output website_url  to get the URL.
+#
+# To switch to custom domain mode:
+#   1. Set use_custom_domain = true
+#   2. Set domain_name and hosted_zone_id below
+#   3. Run terraform apply
 
-aws_region     = "us-east-1"
-environment    = "dev"
-bucket_name    = "erp-frontend-dev"               # must be globally unique — change if taken
-domain_name    = "dev.cloudblitz-in.work.gd"            # change to your actual domain
-hosted_zone_id = "Z086628638YE1AZNQOT5G"                # change to your Route53 hosted zone ID
+aws_region        = "us-east-1"
+environment       = "dev"
+bucket_name       = "erp-frontend-dev"   # must be globally unique in S3
+
+# ── No-domain mode (default) ──────────────────────────────────────────────
+use_custom_domain = false
+# domain_name    = ""    # not needed — leave blank
+# hosted_zone_id = ""    # not needed — leave blank
+
+# ── Custom domain mode — uncomment and fill when use_custom_domain = true ─
+# use_custom_domain = true
+# domain_name       = "dev.example.com"
+# hosted_zone_id    = "Z1234ABCDEFGHIJ"

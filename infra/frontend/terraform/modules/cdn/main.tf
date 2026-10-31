@@ -1,17 +1,23 @@
 # ── CDN Module ────────────────────────────────────────────────────────────
-# Provisions:
-#   • CloudFront Origin Access Control (OAC)
-#   • CloudFront distribution with S3 origin, HTTPS redirect, custom domain
-#   • Route53 A alias record pointing the custom domain at CloudFront
+# Provisions CloudFront + optionally Route53 records.
+#
+# Two modes controlled by var.use_custom_domain:
+#
+#   false (default) — No custom domain, no ACM cert, no Route53.
+#     Frontend URL: https://<random-id>.cloudfront.net
+#     Use this for quick deploys, dev environments, or when you don't own a domain.
+#
+#   true — Custom domain + ACM cert + Route53 A alias records.
+#     Frontend URL: https://<your-domain>
+#     Requires: domain_name, certificate_arn, hosted_zone_id variables set.
 
 # ── Origin Access Control ──────────────────────────────────────────────────
-# OAC is the modern replacement for OAI. It signs requests to S3 using
-# SigV4 so the bucket can verify requests came from this distribution only.
+# OAC signs every request to S3 with SigV4 so the bucket stays private.
 resource "aws_cloudfront_origin_access_control" "frontend" {
   name                              = "${var.bucket_name}-oac"
-  description                       = "OAC for ${var.environment} frontend S3 bucket"
+  description                       = "OAC for ${var.environment} frontend"
   origin_access_control_origin_type = "s3"
-  signing_behavior                  = "always"   # sign every request to S3
+  signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
 }
 
@@ -19,35 +25,32 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   is_ipv6_enabled     = true
-  default_root_object = "index.html"   # served when the root URL is requested
-  price_class         = "PriceClass_100" # US/Europe/Canada edge nodes only — cheapest tier
-  aliases             = [var.domain_name, "www.${var.domain_name}"]
+  default_root_object = "index.html"
+  price_class         = "PriceClass_100"
 
-  # ── S3 Origin ─────────────────────────────────────────────────────────
+  # When use_custom_domain = true, set the aliases so CloudFront accepts
+  # requests for your domain. When false, leave empty — CloudFront assigns
+  # its own *.cloudfront.net domain automatically.
+  aliases = var.use_custom_domain ? [var.domain_name, "www.${var.domain_name}"] : []
+
   origin {
     origin_id                = "s3-${var.bucket_name}"
     domain_name              = var.bucket_regional_domain_name
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
   }
 
-  # ── Default Cache Behaviour ───────────────────────────────────────────
-  # Redirects HTTP to HTTPS. Uses the AWS-managed CachingOptimized policy
-  # which caches based on query strings and headers used by S3.
   default_cache_behavior {
     target_origin_id       = "s3-${var.bucket_name}"
     viewer_protocol_policy = "redirect-to-https"
     allowed_methods        = ["GET", "HEAD"]
     cached_methods         = ["GET", "HEAD"]
-    compress               = true   # gzip/brotli compression at the edge
-
-    # AWS managed policy: CachingOptimized (recommended for S3 origins)
+    compress               = true
+    # AWS managed CachingOptimized policy — recommended for S3 origins
     cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
   }
 
-  # ── SPA Error Handling ────────────────────────────────────────────────
-  # Single-page apps (React/Vue/etc.) use client-side routing. When a user
-  # refreshes on /dashboard, S3 returns a 403 (no such key). CloudFront
-  # catches it and serves index.html with a 200 so the SPA router takes over.
+  # SPA routing — S3 returns 403 for deep routes, CloudFront catches and
+  # serves index.html so the React Router can handle the URL client-side.
   custom_error_response {
     error_code            = 403
     response_code         = 200
@@ -62,21 +65,19 @@ resource "aws_cloudfront_distribution" "frontend" {
     error_caching_min_ttl = 10
   }
 
-  # ── TLS / HTTPS ───────────────────────────────────────────────────────
-  # sni_only = false would require dedicated IP ($600/month) — always use SNI.
-  # TLSv1.2_2021 is the minimum recommended version as of 2024.
+  # ── TLS Certificate ───────────────────────────────────────────────────
+  # use_custom_domain = false → use the free default CloudFront cert
+  #   (covers *.cloudfront.net automatically, no setup needed)
+  # use_custom_domain = true  → use the provided ACM cert
   viewer_certificate {
-    acm_certificate_arn      = var.certificate_arn
-    ssl_support_method       = "sni-only"
-    minimum_protocol_version = "TLSv1.2_2021"
+    cloudfront_default_certificate = var.use_custom_domain ? false : true
+    acm_certificate_arn            = var.use_custom_domain ? var.certificate_arn : null
+    ssl_support_method             = var.use_custom_domain ? "sni-only" : null
+    minimum_protocol_version       = var.use_custom_domain ? "TLSv1.2_2021" : null
   }
 
-  # ── Geo restrictions ──────────────────────────────────────────────────
-  # No restrictions — serve globally. Change to whitelist if needed.
   restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
+    geo_restriction { restriction_type = "none" }
   }
 
   tags = {
@@ -86,10 +87,10 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 }
 
-# ── Route53 — Apex domain A alias record ─────────────────────────────────
-# Alias records are preferred over CNAMEs for apex domains (no subdomain).
-# Both apex and www point to the same CloudFront distribution.
+# ── Route53 records — only created when use_custom_domain = true ──────────
+# count = 0 means the resource is not created at all in no-domain mode.
 resource "aws_route53_record" "frontend_apex" {
+  count   = var.use_custom_domain ? 1 : 0
   zone_id = var.hosted_zone_id
   name    = var.domain_name
   type    = "A"
@@ -101,8 +102,8 @@ resource "aws_route53_record" "frontend_apex" {
   }
 }
 
-# ── Route53 — www subdomain A alias record ────────────────────────────────
 resource "aws_route53_record" "frontend_www" {
+  count   = var.use_custom_domain ? 1 : 0
   zone_id = var.hosted_zone_id
   name    = "www.${var.domain_name}"
   type    = "A"
