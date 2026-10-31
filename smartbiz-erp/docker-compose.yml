@@ -1,0 +1,199 @@
+version: "3.9"
+
+# ── SmartBiz ERP — Docker Compose ─────────────────────────────────────────
+# Spins up the full stack in one command:
+#   docker compose up --build
+#
+# Services:
+#   mongo          → shared MongoDB instance (3 databases inside)
+#   user-service   → :8081
+#   inventory-service → :8082
+#   sales-service  → :8083
+#   frontend       → :80 (Nginx serving Vite build)
+#
+# All services share the "smartbiz-network" bridge network so they can
+# reach each other by service name (e.g. http://inventory-service:8082).
+#
+# Persistent data is stored in the "mongo-data" named volume so MongoDB
+# survives container restarts.
+
+networks:
+  smartbiz-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local
+
+services:
+
+  # ── MongoDB ──────────────────────────────────────────────────────────────
+  # Single MongoDB instance used by all three services.
+  # Each service connects to its own database (smartbiz_users, etc.)
+  # so data is logically isolated even though it's one container.
+  #
+  # ── How to inspect the databases ─────────────────────────────────────────
+  # Option 1 — mongosh CLI (inside the container):
+  #   docker exec -it smartbiz-mongo mongosh
+  #   > use smartbiz_users
+  #   > db.users.find().pretty()
+  #
+  # Option 2 — MongoDB Compass (GUI):
+  #   Download from https://www.mongodb.com/products/compass
+  #   Connection string: mongodb://localhost:27017
+  #
+  # Option 3 — mongo-express web UI (auto-starts with compose):
+  #   Open http://localhost:8090 in your browser
+  mongo:
+    image: mongo:7.0
+    container_name: smartbiz-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"         # expose for local tools like MongoDB Compass
+    volumes:
+      - mongo-data:/data/db   # persist data across restarts
+    networks:
+      - smartbiz-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── User Service ─────────────────────────────────────────────────────────
+  user-service:
+    build:
+      context: ./backend/user-service
+      dockerfile: Dockerfile
+    container_name: smartbiz-user-service
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      # MongoDB URI uses the service name "mongo" — Docker DNS resolves it
+      SPRING_DATA_MONGODB_URI: mongodb://mongo:27017/smartbiz_users
+      SPRING_DATA_MONGODB_DATABASE: smartbiz_users
+      SERVER_PORT: 8081
+      # Override the JWT secret with a strong key in production.
+      # All three services MUST share the same JWT_SECRET so tokens
+      # issued by user-service are accepted by the other services.
+      JWT_SECRET: ${JWT_SECRET:-c21hcnRiaXotZXJwLXVzZXItc2VydmljZS1zZWNyZXQta2V5LTI1NmJpdHMhISE=}
+    depends_on:
+      mongo:
+        condition: service_healthy   # wait until MongoDB passes healthcheck
+    networks:
+      - smartbiz-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ── Inventory Service ─────────────────────────────────────────────────────
+  inventory-service:
+    build:
+      context: ./backend/inventory-service
+      dockerfile: Dockerfile
+    container_name: smartbiz-inventory-service
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATA_MONGODB_URI: mongodb://mongo:27017/smartbiz_inventory
+      SPRING_DATA_MONGODB_DATABASE: smartbiz_inventory
+      SERVER_PORT: 8082
+      JWT_SECRET: ${JWT_SECRET:-c21hcnRiaXotZXJwLXVzZXItc2VydmljZS1zZWNyZXQta2V5LTI1NmJpdHMhISE=}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - smartbiz-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ── Sales Service ─────────────────────────────────────────────────────────
+  # Calls inventory-service by its Docker service name for stock checks.
+  sales-service:
+    build:
+      context: ./backend/sales-service
+      dockerfile: Dockerfile
+    container_name: smartbiz-sales-service
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_DATA_MONGODB_URI: mongodb://mongo:27017/smartbiz_sales
+      SPRING_DATA_MONGODB_DATABASE: smartbiz_sales
+      SERVER_PORT: 8083
+      JWT_SECRET: ${JWT_SECRET:-c21hcnRiaXotZXJwLXVzZXItc2VydmljZS1zZWNyZXQta2V5LTI1NmJpdHMhISE=}
+      # Override the inventory service URL to use the Docker service name
+      INVENTORY_SERVICE_URL: http://inventory-service:8082
+    depends_on:
+      mongo:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy   # ensure inventory is up before sales starts
+    networks:
+      - smartbiz-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  # Vite build served by Nginx.
+  # Backend URLs are baked into the JS bundle at build time via ARGs.
+  # They point to localhost because the browser calls them directly —
+  # NOT via Docker internal networking.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # These are the URLs the BROWSER uses — must be reachable from the
+        # user's machine, not from inside Docker.
+        VITE_USER_API: ${VITE_USER_API:-http://localhost:8081}
+        VITE_INVENTORY_API: ${VITE_INVENTORY_API:-http://localhost:8082}
+        VITE_SALES_API: ${VITE_SALES_API:-http://localhost:8083}
+    container_name: smartbiz-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - user-service
+      - inventory-service
+      - sales-service
+    networks:
+      - smartbiz-network
+
+  # ── Mongo Express ─────────────────────────────────────────────────────────
+  # Web-based MongoDB admin UI — available at http://localhost:8090
+  # Use this to browse all three databases, inspect collections, and
+  # run queries without installing any local tools.
+  # Remove this service block before deploying to production.
+  mongo-express:
+    image: mongo-express:1.0.2
+    container_name: smartbiz-mongo-express
+    restart: unless-stopped
+    ports:
+      - "8090:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_PORT: 27017
+      # Basic auth for the web UI — change these in production
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASS:-smartbiz123}
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - smartbiz-network

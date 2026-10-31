@@ -1,0 +1,164 @@
+// ── EKS Multi-Environment Pipeline ───────────────────────────────────────
+// Supports three environments (dev / stage / prod) and two actions
+// (apply / destroy) via Jenkins build parameters.
+//
+// Prerequisites:
+//   • Jenkins credential "aws-terraform-credentials" with AWS access key + secret
+//   • S3 bucket "terraform-state-erp-project" and DynamoDB table "terraform-locks"
+//     must already exist (create once manually before first run)
+//   • Terraform >= 1.5 installed on the Jenkins agent
+//   • withAWS step provided by the "Pipeline: AWS Steps" Jenkins plugin
+
+pipeline {
+    agent any
+
+    // ── Build Parameters ──────────────────────────────────────────────────
+    // Shown as dropdowns when you click "Build with Parameters" in Jenkins.
+    parameters {
+
+        // Which environment to target
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target environment — selects the matching envs/<env> folder'
+        )
+
+        // Create or tear down
+        choice(
+            name: 'ACTION',
+            choices: ['apply', 'destroy'],
+            description: 'apply = create/update infra | destroy = tear everything down'
+        )
+    }
+
+    environment {
+        // Resolve the Terraform working directory from the chosen environment.
+        // e.g. ENVIRONMENT=dev  →  TF_DIR=terraform/envs/dev
+        TF_DIR     = "terraform/envs/${params.ENVIRONMENT}"
+        AWS_REGION = "us-east-1"
+    }
+
+    stages {
+
+        // ── Stage 1: Pull ─────────────────────────────────────────────────
+        // Clone the repo so the agent always works from a clean copy.
+        stage('Pull') {
+            steps {
+                echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} action=${params.ACTION} ====="
+                git branch: 'main',
+                    url: 'https://github.com/CK23004/erp-project.git'
+                sh "ls -la ${TF_DIR}/"
+            }
+        }
+
+        // ── Stage 2: Init ─────────────────────────────────────────────────
+        // Downloads providers and configures the S3 remote backend.
+        // -input=false prevents Terraform from waiting for keyboard input.
+        stage('Init') {
+            steps {
+                echo "===== Stage 2: Terraform Init ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("${TF_DIR}") {
+                        sh 'terraform init -input=false'
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Plan ─────────────────────────────────────────────────
+        // Runs terraform plan (or plan -destroy) and saves a binary plan file.
+        // The text version is archived as a build artifact for easy review.
+        stage('Plan') {
+            steps {
+                echo "===== Stage 3: Terraform Plan ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("${TF_DIR}") {
+                        // Use -destroy flag when the action is destroy so the plan
+                        // shows exactly what will be removed before approval.
+                        sh """
+                            if [ "${params.ACTION}" = "destroy" ]; then
+                                terraform plan -destroy -input=false -out=tfplan.binary
+                            else
+                                terraform plan -input=false -out=tfplan.binary
+                            fi
+                        """
+                        sh 'terraform show -no-color tfplan.binary > tfplan.txt'
+                        sh 'echo "=== PLAN OUTPUT ===" && cat tfplan.txt'
+                    }
+                }
+            }
+            post {
+                // Archive the human-readable plan so it's downloadable from the build page.
+                always {
+                    archiveArtifacts artifacts: "${TF_DIR}/tfplan.txt",
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 4: Approval ─────────────────────────────────────────────
+        // Pauses the pipeline and waits for a human to review and confirm.
+        // Prod destroy gets a stronger warning message.
+        stage('Approval') {
+            steps {
+                echo "===== Stage 4: Waiting for Manual Approval ====="
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Review tfplan.txt artifact above. Apply ${params.ACTION} to ${params.ENVIRONMENT}?",
+                          ok: "Yes, run ${params.ACTION} on ${params.ENVIRONMENT}"
+                }
+            }
+        }
+
+        // ── Stage 5: Apply / Destroy ──────────────────────────────────────
+        // Executes the saved plan. Using the saved binary plan (not re-planning)
+        // guarantees exactly what was reviewed gets applied or destroyed.
+        stage('Execute') {
+            steps {
+                echo "===== Stage 5: Terraform ${params.ACTION} on ${params.ENVIRONMENT} ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("${TF_DIR}") {
+                        // Both apply and destroy use the same saved plan file.
+                        // -auto-approve is safe here because a human already approved above.
+                        sh 'terraform apply -input=false -auto-approve tfplan.binary'
+                    }
+                }
+            }
+        }
+
+        // ── Stage 6: Outputs ──────────────────────────────────────────────
+        // Print cluster details (endpoint, kubectl command, etc.) after apply.
+        // Skipped automatically on destroy because resources no longer exist.
+        stage('Output') {
+            when {
+                // Only show outputs after a successful apply, not after destroy.
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "===== Stage 6: Terraform Outputs ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("${TF_DIR}") {
+                        sh 'terraform output'
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Post-run Notifications ────────────────────────────────────────────
+    post {
+        success {
+            echo """
+✅ ${params.ACTION} completed successfully for environment: ${params.ENVIRONMENT}
+
+${params.ACTION == 'apply' ? "Run the 'configure_kubectl' output command above to connect kubectl." : "All resources for ${params.ENVIRONMENT} have been destroyed."}
+            """
+        }
+        failure {
+            echo "❌ Pipeline failed at ${params.ACTION} for ${params.ENVIRONMENT}. Check the Execute stage logs."
+        }
+        always {
+            // Clean workspace after every run to avoid stale plan files.
+            cleanWs()
+        }
+    }
+}

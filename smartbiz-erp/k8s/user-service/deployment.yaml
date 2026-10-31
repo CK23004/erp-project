@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  labels:
+    app: user-service
+    component: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0      # zero-downtime rolling update
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      # Pods spread across AZs using the node topology label
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: user-service
+      containers:
+        - name: user-service
+          image: USER_SERVICE_IMAGE   # replaced by Jenkins pipeline: <ecr-repo>:$BUILD_NUMBER
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+          env:
+            # MongoDB URI — inject from Kubernetes Secret (see secret.yaml)
+            - name: SPRING_DATA_MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: smartbiz-secrets
+                  key: MONGO_URI_USERS
+            - name: SPRING_DATA_MONGODB_DATABASE
+              value: "smartbiz_users"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: smartbiz-secrets
+                  key: JWT_SECRET
+            - name: SERVER_PORT
+              value: "8081"
+          # Liveness: restart the pod if the app hangs
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness: stop sending traffic until the app is ready
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

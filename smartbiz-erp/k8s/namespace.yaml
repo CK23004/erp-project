@@ -1,0 +1,9 @@
+# ── Namespace ─────────────────────────────────────────────────────────────
+# All SmartBiz ERP resources live in the "smartbiz" namespace.
+# This isolates the app from other workloads on the same cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smartbiz
+  labels:
+    app: smartbiz-erp

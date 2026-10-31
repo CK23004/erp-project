@@ -1,0 +1,326 @@
+// ── SmartBiz ERP — Backend CI/CD Pipeline ────────────────────────────────
+// Builds, tests, scans, containerises and deploys all three Spring Boot
+// services to the EKS cluster provisioned by the infra pipeline.
+//
+// Flow:
+//   Pull → Test + SonarQube → Build JARs → Docker Build+Push ECR
+//        → Update K8s Secrets → Deploy to EKS → Verify Rollout
+//
+// Jenkins Credentials required (Manage Jenkins → Credentials):
+//   aws-terraform-credentials   → AWS Credentials (access key + secret)
+//   sonar-token                 → Secret text (SonarQube user token)
+//   jwt-secret                  → Secret text (JWT signing key)
+//   mongo-uri-users             → Secret text (Atlas or local Mongo URI)
+//   mongo-uri-inventory         → Secret text
+//   mongo-uri-sales             → Secret text
+//
+// Jenkins Plugins required:
+//   Pipeline: AWS Steps, Docker Pipeline, Kubernetes CLI, SonarQube Scanner
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target EKS cluster — eks-dev | eks-stage | eks-prod'
+        )
+        booleanParam(
+            name: 'SKIP_SONAR',
+            defaultValue: false,
+            description: 'Skip SonarQube scan (useful for hotfix deploys)'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip unit tests — not recommended'
+        )
+    }
+
+    environment {
+        AWS_REGION      = "us-east-1"
+        AWS_ACCOUNT_ID  = sh(script: "aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        EKS_CLUSTER     = "eks-${params.ENVIRONMENT}"
+        K8S_NAMESPACE   = "smartbiz"
+        IMAGE_TAG       = "${params.ENVIRONMENT}-${BUILD_NUMBER}"
+        SONAR_HOST      = "http://localhost:9000"   // change to your SonarQube URL
+        GIT_REPO        = "https://github.com/CK23004/erp-project.git"
+    }
+
+    stages {
+
+        // ── Stage 1: Pull ─────────────────────────────────────────────────
+        stage('Pull') {
+            steps {
+                echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} build=${BUILD_NUMBER} ====="
+                git branch: 'main', url: "${GIT_REPO}"
+                sh 'ls -la smartbiz-erp/backend/'
+            }
+        }
+
+        // ── Stage 2: Test — parallel ──────────────────────────────────────
+        // mvn clean verify compiles + runs JUnit + generates JaCoCo XML report.
+        // All three services run in parallel on the same agent.
+        stage('Test') {
+            when { expression { !params.SKIP_TESTS } }
+            parallel {
+                stage('user-service tests') {
+                    steps {
+                        dir('smartbiz-erp/backend/user-service') {
+                            sh 'mvn clean verify -B -q'
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true,
+                                  testResults: 'smartbiz-erp/backend/user-service/target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+                stage('inventory-service tests') {
+                    steps {
+                        dir('smartbiz-erp/backend/inventory-service') {
+                            sh 'mvn clean verify -B -q'
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true,
+                                  testResults: 'smartbiz-erp/backend/inventory-service/target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+                stage('sales-service tests') {
+                    steps {
+                        dir('smartbiz-erp/backend/sales-service') {
+                            sh 'mvn clean verify -B -q'
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true,
+                                  testResults: 'smartbiz-erp/backend/sales-service/target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: SonarQube Analysis ───────────────────────────────────
+        // Runs after tests so JaCoCo XML report already exists.
+        // qualitygate.wait=true blocks until SonarQube returns a result.
+        // Pipeline fails if quality gate is not met.
+        stage('SonarQube Analysis') {
+            when { expression { !params.SKIP_SONAR } }
+            steps {
+                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                    parallel(
+                        'sonar-user-service': {
+                            dir('smartbiz-erp/backend/user-service') {
+                                sh """
+                                    mvn sonar:sonar \
+                                      -Dsonar.host.url=${SONAR_HOST} \
+                                      -Dsonar.token=${SONAR_TOKEN} \
+                                      -Dsonar.projectKey=smartbiz-user-service \
+                                      -Dsonar.qualitygate.wait=true \
+                                      -B -q
+                                """
+                            }
+                        },
+                        'sonar-inventory-service': {
+                            dir('smartbiz-erp/backend/inventory-service') {
+                                sh """
+                                    mvn sonar:sonar \
+                                      -Dsonar.host.url=${SONAR_HOST} \
+                                      -Dsonar.token=${SONAR_TOKEN} \
+                                      -Dsonar.projectKey=smartbiz-inventory-service \
+                                      -Dsonar.qualitygate.wait=true \
+                                      -B -q
+                                """
+                            }
+                        },
+                        'sonar-sales-service': {
+                            dir('smartbiz-erp/backend/sales-service') {
+                                sh """
+                                    mvn sonar:sonar \
+                                      -Dsonar.host.url=${SONAR_HOST} \
+                                      -Dsonar.token=${SONAR_TOKEN} \
+                                      -Dsonar.projectKey=smartbiz-sales-service \
+                                      -Dsonar.qualitygate.wait=true \
+                                      -B -q
+                                """
+                            }
+                        }
+                    )
+                }
+            }
+        }
+
+        // ── Stage 4: Build JARs ───────────────────────────────────────────
+        // Tests already ran in Stage 2 — skip here to save time.
+        stage('Build JARs') {
+            steps {
+                echo "===== Stage 4: Package fat JARs ====="
+                parallel(
+                    'build-user':      { dir('smartbiz-erp/backend/user-service')      { sh 'mvn package -DskipTests -B -q' } },
+                    'build-inventory': { dir('smartbiz-erp/backend/inventory-service') { sh 'mvn package -DskipTests -B -q' } },
+                    'build-sales':     { dir('smartbiz-erp/backend/sales-service')     { sh 'mvn package -DskipTests -B -q' } }
+                )
+            }
+        }
+
+        // ── Stage 5: Docker Build & Push to ECR ──────────────────────────
+        // Authenticates to ECR, builds each image, tags with env+buildNumber
+        // and env-latest, then pushes both tags.
+        stage('Docker Build & Push') {
+            steps {
+                echo "===== Stage 5: Build Docker images and push to ECR ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    """
+                    parallel(
+                        'push-user': {
+                            dir('smartbiz-erp/backend/user-service') {
+                                sh """
+                                    docker build -t ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} .
+                                    docker push ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
+                                    docker tag  ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} \
+                                                ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                    docker push ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                """
+                            }
+                        },
+                        'push-inventory': {
+                            dir('smartbiz-erp/backend/inventory-service') {
+                                sh """
+                                    docker build -t ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} .
+                                    docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
+                                    docker tag  ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} \
+                                                ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                    docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                """
+                            }
+                        },
+                        'push-sales': {
+                            dir('smartbiz-erp/backend/sales-service') {
+                                sh """
+                                    docker build -t ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} .
+                                    docker push ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
+                                    docker tag  ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} \
+                                                ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                    docker push ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                """
+                            }
+                        }
+                    )
+                }
+            }
+        }
+
+        // ── Stage 6: Approval (prod only) ─────────────────────────────────
+        stage('Approval') {
+            when { expression { params.ENVIRONMENT == 'prod' } }
+            steps {
+                echo "===== Stage 6: Manual approval required for PROD deploy ====="
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Deploy build ${BUILD_NUMBER} to PRODUCTION EKS cluster?",
+                          ok: "Yes, deploy to prod"
+                }
+            }
+        }
+
+        // ── Stage 7: Deploy to EKS ────────────────────────────────────────
+        // Configures kubectl, creates/updates secrets from Jenkins credentials,
+        // substitutes image tags in manifests, then applies all K8s resources.
+        stage('Deploy to EKS') {
+            steps {
+                echo "===== Stage 7: Deploy to EKS (${EKS_CLUSTER}) ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    withCredentials([
+                        string(credentialsId: 'jwt-secret',         variable: 'JWT_SECRET_VAL'),
+                        string(credentialsId: 'mongo-uri-users',     variable: 'MONGO_URI_USERS_VAL'),
+                        string(credentialsId: 'mongo-uri-inventory', variable: 'MONGO_URI_INVENTORY_VAL'),
+                        string(credentialsId: 'mongo-uri-sales',     variable: 'MONGO_URI_SALES_VAL'),
+                    ]) {
+                        sh """
+                            aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+
+                            kubectl apply -f smartbiz-erp/k8s/namespace.yaml
+
+                            # Create or update the secret — dry-run+apply is idempotent
+                            kubectl create secret generic smartbiz-secrets \
+                              --namespace=${K8S_NAMESPACE} \
+                              --from-literal=JWT_SECRET="${JWT_SECRET_VAL}" \
+                              --from-literal=MONGO_URI_USERS="${MONGO_URI_USERS_VAL}" \
+                              --from-literal=MONGO_URI_INVENTORY="${MONGO_URI_INVENTORY_VAL}" \
+                              --from-literal=MONGO_URI_SALES="${MONGO_URI_SALES_VAL}" \
+                              --dry-run=client -o yaml | kubectl apply -f -
+
+                            sed 's|USER_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}|g' \
+                              smartbiz-erp/k8s/user-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
+
+                            sed 's|INVENTORY_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}|g' \
+                              smartbiz-erp/k8s/inventory-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
+
+                            sed 's|SALES_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}|g' \
+                              smartbiz-erp/k8s/sales-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
+
+                            kubectl apply -n ${K8S_NAMESPACE} -f smartbiz-erp/k8s/user-service/service.yaml
+                            kubectl apply -n ${K8S_NAMESPACE} -f smartbiz-erp/k8s/inventory-service/service.yaml
+                            kubectl apply -n ${K8S_NAMESPACE} -f smartbiz-erp/k8s/sales-service/service.yaml
+                            kubectl apply -n ${K8S_NAMESPACE} -f smartbiz-erp/k8s/ingress.yaml
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 8: Verify Rollout ───────────────────────────────────────
+        // Blocks until all deployments are fully rolled out or times out.
+        stage('Verify Rollout') {
+            steps {
+                echo "===== Stage 8: Verify rollout health ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    sh """
+                        aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+
+                        kubectl rollout status deployment/user-service      -n ${K8S_NAMESPACE} --timeout=180s
+                        kubectl rollout status deployment/inventory-service  -n ${K8S_NAMESPACE} --timeout=180s
+                        kubectl rollout status deployment/sales-service      -n ${K8S_NAMESPACE} --timeout=180s
+
+                        echo "=== Running pods ==="
+                        kubectl get pods -n ${K8S_NAMESPACE}
+                        echo "=== Ingress ==="
+                        kubectl get ingress -n ${K8S_NAMESPACE}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+✅ Backend deploy SUCCESS — env=${params.ENVIRONMENT}  build=${BUILD_NUMBER}
+
+  Images pushed:
+    ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
+    ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
+    ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
+
+  SonarQube: ${SONAR_HOST}/projects
+            """
+        }
+        failure {
+            echo "❌ Pipeline FAILED for ${params.ENVIRONMENT}. Previous pods are still running."
+        }
+        always {
+            sh 'docker image prune -f || true'
+            cleanWs()
+        }
+    }
+}

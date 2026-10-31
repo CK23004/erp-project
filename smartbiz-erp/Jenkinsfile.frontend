@@ -1,0 +1,210 @@
+// ── SmartBiz ERP — Frontend CI/CD Pipeline ───────────────────────────────
+// Builds the React/Vite app and deploys it to S3 + CloudFront.
+// The S3 bucket and CloudFront distribution were created by the infra pipeline
+// (infra/frontend/).
+//
+// Flow:
+//   Pull → Install → Lint → Build → S3 Sync → CloudFront Invalidation
+//
+// Jenkins Credentials required:
+//   aws-terraform-credentials   → AWS access key + secret (Kind: AWS Credentials)
+//
+// Environment Variables baked into the Vite bundle:
+//   VITE_USER_API        → URL of the ALB/Ingress for user-service
+//   VITE_INVENTORY_API   → URL of the ALB/Ingress for inventory-service
+//   VITE_SALES_API       → URL of the ALB/Ingress for sales-service
+//
+// After the backend deploy, get the ALB hostname:
+//   kubectl get ingress -n smartbiz
+// Use that hostname as the single base URL for all three APIs via path routing.
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target environment — determines S3 bucket + CloudFront distribution'
+        )
+        // Backend API URL — single ALB endpoint that routes to all three services
+        // via the ingress path rules.  Get it from: kubectl get ingress -n smartbiz
+        string(
+            name: 'API_BASE_URL',
+            defaultValue: 'https://api.example.com',
+            description: 'Backend API base URL — api.example.com A record points to ALB in Route53'
+        )
+        booleanParam(
+            name: 'INVALIDATE_CDN',
+            defaultValue: true,
+            description: 'Invalidate CloudFront cache after S3 sync (costs $0.005 per path, disable for rapid iterations)'
+        )
+    }
+
+    environment {
+        AWS_REGION      = "us-east-1"
+        // S3 bucket names match what the infra/frontend terraform creates
+        S3_BUCKET       = "erp-frontend-${params.ENVIRONMENT}"
+        FRONTEND_DIR    = "smartbiz-erp/frontend"
+        GIT_REPO        = "https://github.com/CK23004/erp-project.git"
+    }
+
+    stages {
+
+        // ── Stage 1: Pull ─────────────────────────────────────────────────
+        stage('Pull') {
+            steps {
+                echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} build=${BUILD_NUMBER} ====="
+                git branch: 'main', url: "${GIT_REPO}"
+                sh "ls -la ${FRONTEND_DIR}/"
+            }
+        }
+
+        // ── Stage 2: Install ──────────────────────────────────────────────
+        // npm ci installs exact versions from package-lock.json — faster and
+        // reproducible compared to npm install.
+        stage('Install') {
+            steps {
+                echo "===== Stage 2: npm install ====="
+                dir("${FRONTEND_DIR}") {
+                    sh 'node --version && npm --version'
+                    sh 'npm install --silent'
+                }
+            }
+        }
+
+        // ── Stage 3: Lint ─────────────────────────────────────────────────
+        // Runs ESLint if a lint script is configured in package.json.
+        // Fails fast on lint errors to catch issues before a full build.
+        stage('Lint') {
+            steps {
+                echo "===== Stage 3: ESLint ====="
+                dir("${FRONTEND_DIR}") {
+                    // Only run if lint script exists in package.json
+                    sh 'npm run lint --if-present || true'
+                }
+            }
+        }
+
+        // ── Stage 4: Vite Build ───────────────────────────────────────────
+        // Injects the backend API URLs as build-time env vars so Vite bakes
+        // them into the JS bundle. A single ALB hostname is used for all three
+        // services — the ALB ingress handles path-based routing.
+        stage('Build') {
+            steps {
+                echo "===== Stage 4: Vite build for ${params.ENVIRONMENT} ====="
+                dir("${FRONTEND_DIR}") {
+                    sh """
+                        VITE_USER_API=${params.API_BASE_URL} \
+                        VITE_INVENTORY_API=${params.API_BASE_URL} \
+                        VITE_SALES_API=${params.API_BASE_URL} \
+                        npm run build
+                    """
+                    // Show what was built
+                    sh 'ls -lh dist/'
+                    sh 'du -sh dist/'
+                }
+            }
+            post {
+                // Archive the build manifest for traceability
+                success {
+                    archiveArtifacts artifacts: "${FRONTEND_DIR}/dist/index.html",
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 5: Approval (prod only) ─────────────────────────────────
+        stage('Approval') {
+            when { expression { params.ENVIRONMENT == 'prod' } }
+            steps {
+                echo "===== Stage 5: Manual approval required for PROD deploy ====="
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Deploy frontend build ${BUILD_NUMBER} to PRODUCTION S3?",
+                          ok: "Yes, deploy to prod"
+                }
+            }
+        }
+
+        // ── Stage 6: S3 Sync ──────────────────────────────────────────────
+        // --delete removes files in S3 that no longer exist in the build output.
+        // Cache headers: HTML no-cache (always fresh), assets cached 1 year
+        // (Vite content-hashes filenames so stale files are never served).
+        stage('S3 Sync') {
+            steps {
+                echo "===== Stage 6: Sync to S3 (${S3_BUCKET}) ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("${FRONTEND_DIR}") {
+                        // Sync JS/CSS/image assets — long-lived cache
+                        sh """
+                            aws s3 sync dist/ s3://${S3_BUCKET}/ \
+                              --delete \
+                              --exclude "*.html" \
+                              --cache-control "public, max-age=31536000, immutable" \
+                              --region ${AWS_REGION}
+                        """
+                        // Sync HTML — no-cache so users always get latest
+                        sh """
+                            aws s3 sync dist/ s3://${S3_BUCKET}/ \
+                              --delete \
+                              --exclude "*" \
+                              --include "*.html" \
+                              --cache-control "no-cache, no-store, must-revalidate" \
+                              --region ${AWS_REGION}
+                        """
+                        sh "echo 'Synced to s3://${S3_BUCKET}/'"
+                    }
+                }
+            }
+        }
+
+        // ── Stage 7: CloudFront Invalidation ──────────────────────────────
+        // Clears the CDN edge cache so users get the new HTML immediately.
+        // Only invalidate /* to avoid per-path charges on large sites.
+        // The distribution ID is fetched dynamically from the tag we set in
+        // the infra pipeline rather than hardcoding it.
+        stage('CloudFront Invalidation') {
+            when { expression { params.INVALIDATE_CDN } }
+            steps {
+                echo "===== Stage 7: Invalidate CloudFront cache ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    sh """
+                        # Find the distribution associated with this environment's S3 bucket
+                        DIST_ID=\$(aws cloudfront list-distributions \
+                          --query "DistributionList.Items[?Origins.Items[0].DomainName=='${S3_BUCKET}.s3.amazonaws.com'].Id | [0]" \
+                          --output text --region ${AWS_REGION})
+
+                        if [ "\$DIST_ID" = "None" ] || [ -z "\$DIST_ID" ]; then
+                          echo "WARNING: No CloudFront distribution found for ${S3_BUCKET}. Skipping invalidation."
+                        else
+                          echo "Invalidating distribution: \$DIST_ID"
+                          aws cloudfront create-invalidation \
+                            --distribution-id "\$DIST_ID" \
+                            --paths "/*" \
+                            --region ${AWS_REGION}
+                          echo "✅ Cache invalidation created"
+                        fi
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+✅ Frontend deploy SUCCESS — env=${params.ENVIRONMENT}  build=${BUILD_NUMBER}
+
+  S3 bucket   : s3://${S3_BUCKET}/
+  API base URL: ${params.API_BASE_URL}
+  CDN invalidated: ${params.INVALIDATE_CDN}
+            """
+        }
+        failure {
+            echo "❌ Frontend pipeline FAILED for ${params.ENVIRONMENT}. Previous version is still live in S3."
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,149 @@
+// ── Frontend Infrastructure Pipeline ──────────────────────────────────────
+// Manages the S3 + CloudFront + ACM + Route53 stack for the ERP frontend.
+// Same pattern as the backend EKS pipeline: env choice + apply/destroy.
+//
+// Prerequisites:
+//   • Jenkins credential "aws-terraform-credentials" with AWS access key + secret
+//   • S3 bucket "terraform-state-erp-project" and DynamoDB table "terraform-locks"
+//     must already exist (shared with EKS backend infra)
+//   • Terraform >= 1.5 on the Jenkins agent
+//   • Route53 hosted zone for your domain must already exist
+
+pipeline {
+    agent any
+
+    parameters {
+        // Which environment to target
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target environment — selects envs/<env> folder'
+        )
+
+        // Create or tear down
+        choice(
+            name: 'ACTION',
+            choices: ['apply', 'destroy'],
+            description: 'apply = create/update infra | destroy = tear everything down'
+        )
+    }
+
+    environment {
+        // Resolves to e.g. terraform/envs/dev
+        TF_DIR     = "terraform/envs/${params.ENVIRONMENT}"
+        AWS_REGION = "us-east-1"
+    }
+
+    stages {
+
+        // ── Stage 1: Pull ─────────────────────────────────────────────────
+        stage('Pull') {
+            steps {
+                echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} action=${params.ACTION} ====="
+                git branch: 'main',
+                    url: 'https://github.com/CK23004/erp-project.git'
+                sh "ls -la infra/frontend/${TF_DIR}/"
+            }
+        }
+
+        // ── Stage 2: Init ─────────────────────────────────────────────────
+        // Downloads AWS provider and configures the S3 remote backend.
+        stage('Init') {
+            steps {
+                echo "===== Stage 2: Terraform Init ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("infra/frontend/${TF_DIR}") {
+                        sh 'terraform init -input=false'
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Plan ─────────────────────────────────────────────────
+        // Saves a binary plan and archives a readable text copy as an artifact.
+        stage('Plan') {
+            steps {
+                echo "===== Stage 3: Terraform Plan ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("infra/frontend/${TF_DIR}") {
+                        sh """
+                            if [ "${params.ACTION}" = "destroy" ]; then
+                                terraform plan -destroy -input=false -out=tfplan.binary
+                            else
+                                terraform plan -input=false -out=tfplan.binary
+                            fi
+                        """
+                        sh 'terraform show -no-color tfplan.binary > tfplan.txt'
+                        sh 'echo "=== PLAN OUTPUT ===" && cat tfplan.txt'
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "infra/frontend/${TF_DIR}/tfplan.txt",
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 4: Approval ─────────────────────────────────────────────
+        // Human must review the plan artifact before infra is touched.
+        stage('Approval') {
+            steps {
+                echo "===== Stage 4: Waiting for Manual Approval ====="
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Review tfplan.txt above. Run ${params.ACTION} on frontend ${params.ENVIRONMENT}?",
+                          ok: "Yes, ${params.ACTION} ${params.ENVIRONMENT}"
+                }
+            }
+        }
+
+        // ── Stage 5: Apply / Destroy ──────────────────────────────────────
+        // Executes exactly the plan that was reviewed — no re-plan.
+        stage('Execute') {
+            steps {
+                echo "===== Stage 5: Terraform ${params.ACTION} on ${params.ENVIRONMENT} ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("infra/frontend/${TF_DIR}") {
+                        sh 'terraform apply -input=false -auto-approve tfplan.binary'
+                    }
+                }
+            }
+        }
+
+        // ── Stage 6: Outputs ──────────────────────────────────────────────
+        // Prints website URL, CloudFront ID, and S3 bucket name after apply.
+        // Skipped on destroy since resources are gone.
+        stage('Output') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "===== Stage 6: Terraform Outputs ====="
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    dir("infra/frontend/${TF_DIR}") {
+                        sh 'terraform output'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+✅ Frontend ${params.ACTION} completed for environment: ${params.ENVIRONMENT}
+
+${params.ACTION == 'apply' ?
+  "After uploading your build to S3, invalidate the cache:\n  aws cloudfront create-invalidation --distribution-id <id from output> --paths '/*'" :
+  "All frontend resources for ${params.ENVIRONMENT} have been destroyed."}
+            """
+        }
+        failure {
+            echo "❌ Pipeline failed for frontend ${params.ENVIRONMENT} ${params.ACTION}. Check stage logs."
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

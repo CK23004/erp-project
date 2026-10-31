@@ -1,0 +1,178 @@
+# ── ALB Ingress ────────────────────────────────────────────────────────────
+# Routes external HTTPS traffic from api.example.com to all three backend
+# services via path-based routing.
+#
+# Domain layout:
+#   example.com          → React frontend (S3 + CloudFront, managed by infra/frontend)
+#   api.example.com      → This ingress → ALB → EKS services
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller installed on the cluster:
+#        helm repo add eks https://aws.github.io/eks-charts
+#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#          -n kube-system --set clusterName=<cluster-name>
+#
+#   2. ACM certificate for api.example.com in us-east-1.
+#      Replace REPLACE_WITH_ACM_CERT_ARN below with the real ARN.
+#      Create the cert and DNS-validate it via ACM console or CLI.
+#
+#   3. Route53 A alias record:
+#        api.example.com  →  ALB DNS name (created after first ingress apply)
+#        Get ALB DNS: kubectl get ingress smartbiz-ingress -n smartbiz
+#        Then add Route53 alias in console or via Terraform.
+#
+# Path routing:
+#   /api/auth/*         → user-service
+#   /api/users/*        → user-service
+#   /api/employees/*    → user-service
+#   /api/departments/*  → user-service
+#   /api/products/*     → inventory-service
+#   /api/categories/*   → inventory-service
+#   /api/suppliers/*    → inventory-service
+#   /api/purchases/*    → inventory-service
+#   /api/stock/*        → inventory-service
+#   /api/customers/*    → sales-service
+#   /api/orders/*       → sales-service
+#   /api/invoices/*     → sales-service
+#   /api/payments/*     → sales-service
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smartbiz-ingress
+  namespace: smartbiz
+  annotations:
+    # Use the AWS Load Balancer Controller
+    kubernetes.io/ingress.class: alb
+
+    # Internet-facing ALB — accessible from outside the VPC
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # IP target type — routes directly to pod IPs (required for Fargate / recommended for EKS)
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # ACM certificate for api.example.com — HTTPS on port 443
+    # Replace with your actual ACM certificate ARN
+    alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
+
+    # Redirect HTTP → HTTPS at the ALB level
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # Health check — all services expose /actuator/health
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # Security — drop malformed headers
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true
+
+    # CORS — allow requests from the frontend domain
+    alb.ingress.kubernetes.io/cors-allow-origin: "https://example.com,https://www.example.com"
+    alb.ingress.kubernetes.io/cors-allow-methods: "GET,POST,PUT,DELETE,OPTIONS"
+    alb.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,Accept,Origin"
+
+spec:
+  rules:
+    # All backend APIs are served under api.example.com
+    - host: api.example.com
+      http:
+        paths:
+
+          # ── User Service ──────────────────────────────────────────────
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+          - path: /api/users
+            pathType: Prefix
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+          - path: /api/employees
+            pathType: Prefix
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+          - path: /api/departments
+            pathType: Prefix
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+
+          # ── Inventory Service ─────────────────────────────────────────
+          - path: /api/products
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+          - path: /api/categories
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+          - path: /api/suppliers
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+          - path: /api/purchases
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+          - path: /api/stock
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+
+          # ── Sales Service ─────────────────────────────────────────────
+          - path: /api/customers
+            pathType: Prefix
+            backend:
+              service:
+                name: sales-service
+                port:
+                  number: 80
+          - path: /api/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: sales-service
+                port:
+                  number: 80
+          - path: /api/invoices
+            pathType: Prefix
+            backend:
+              service:
+                name: sales-service
+                port:
+                  number: 80
+          - path: /api/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: sales-service
+                port:
+                  number: 80
