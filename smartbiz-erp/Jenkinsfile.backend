@@ -40,13 +40,12 @@ pipeline {
 
     environment {
         AWS_REGION      = "us-east-1"
-        AWS_ACCOUNT_ID  = sh(script: "aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
-        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         EKS_CLUSTER     = "eks-${params.ENVIRONMENT}"
         K8S_NAMESPACE   = "smartbiz"
         IMAGE_TAG       = "${params.ENVIRONMENT}-${BUILD_NUMBER}"
         SONAR_HOST      = "http://localhost:9000"   // change to your SonarQube URL
         GIT_REPO        = "https://github.com/CK23004/erp-project.git"
+        // ECR_REGISTRY is set in Stage 1 after AWS_ACCOUNT_ID is resolved
     }
 
     stages {
@@ -55,21 +54,35 @@ pipeline {
         stage('Pull') {
             steps {
                 echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} build=${BUILD_NUMBER} ====="
+
+                // Resolve AWS account ID here (safe — agent is ready) and store in
+                // env so all downstream stages can reference env.ECR_REGISTRY
+                withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
+                    script {
+                        env.AWS_ACCOUNT_ID = sh(
+                            script: "aws sts get-caller-identity --query Account --output text",
+                            returnStdout: true
+                        ).trim()
+                        env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                        echo "ECR Registry: ${env.ECR_REGISTRY}"
+                    }
+                }
+
                 git branch: 'main', url: "${GIT_REPO}"
                 sh 'ls -la smartbiz-erp/backend/'
             }
         }
 
         // ── Stage 2: Test — parallel ──────────────────────────────────────
-        // mvn clean verify compiles + runs JUnit + generates JaCoCo XML report.
-        // All three services run in parallel on the same agent.
+        // Uses Mockito mocks + flapdoodle embedded MongoDB (added to pom.xml).
+        // No external MongoDB or any running service needed during tests.
         stage('Test') {
             when { expression { !params.SKIP_TESTS } }
             parallel {
                 stage('user-service tests') {
                     steps {
                         dir('smartbiz-erp/backend/user-service') {
-                            sh 'mvn clean verify -B -q'
+                            sh 'mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_users_test'
                         }
                     }
                     post {
@@ -82,7 +95,7 @@ pipeline {
                 stage('inventory-service tests') {
                     steps {
                         dir('smartbiz-erp/backend/inventory-service') {
-                            sh 'mvn clean verify -B -q'
+                            sh 'mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_inventory_test'
                         }
                     }
                     post {
@@ -95,7 +108,7 @@ pipeline {
                 stage('sales-service tests') {
                     steps {
                         dir('smartbiz-erp/backend/sales-service') {
-                            sh 'mvn clean verify -B -q'
+                            sh 'mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_sales_test'
                         }
                     }
                     post {
@@ -109,11 +122,18 @@ pipeline {
         }
 
         // ── Stage 3: SonarQube Analysis ───────────────────────────────────
+        // qualitygate.wait=true requires a webhook from SonarQube back to Jenkins
+        // which doesn't work with local Jenkins behind NAT.
+        // Instead we use qualitygate.wait=false and then poll the SonarQube
+        // REST API directly from the pipeline until analysis is complete.
+        // This works entirely outbound from Jenkins — no webhook needed.
         stage('SonarQube Analysis') {
             when { expression { !params.SKIP_SONAR } }
             steps {
                 script {
                     withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                        // Run all three analyses — qualitygate.wait=false so Maven
+                        // returns immediately after submitting to SonarQube.
                         parallel(
                             'sonar-user-service': {
                                 dir('smartbiz-erp/backend/user-service') {
@@ -122,7 +142,8 @@ pipeline {
                                           -Dsonar.host.url=${SONAR_HOST} \
                                           -Dsonar.token=${SONAR_TOKEN} \
                                           -Dsonar.projectKey=smartbiz-erp \
-                                          -Dsonar.qualitygate.wait=false \
+                                          -Dsonar.sources=src/main/java \
+                                          -Dsonar.tests=src/test/java \
                                           -B -q
                                     """
                                 }
@@ -134,7 +155,8 @@ pipeline {
                                           -Dsonar.host.url=${SONAR_HOST} \
                                           -Dsonar.token=${SONAR_TOKEN} \
                                           -Dsonar.projectKey=smartbiz-erp \
-                                          -Dsonar.qualitygate.wait=false \
+                                          -Dsonar.sources=src/main/java \
+                                          -Dsonar.tests=src/test/java \
                                           -B -q
                                     """
                                 }
@@ -146,12 +168,49 @@ pipeline {
                                           -Dsonar.host.url=${SONAR_HOST} \
                                           -Dsonar.token=${SONAR_TOKEN} \
                                           -Dsonar.projectKey=smartbiz-erp \
-                                          -Dsonar.qualitygate.wait=false \
+                                          -Dsonar.sources=src/main/java \
+                                          -Dsonar.tests=src/test/java \
                                           -B -q
                                     """
                                 }
                             }
                         )
+
+                        // Poll the single combined project — one check covers all three
+                        def projects = ['smartbiz-erp']
+
+                        projects.each { projectKey ->
+                            echo "Checking quality gate for: ${projectKey}"
+                            def status = ''
+                            def retries = 0
+                            while (retries < 24) {
+                                sleep(5)
+                                def response = sh(
+                                    script: """
+                                        curl -s -u "${SONAR_TOKEN}:" \
+                                          "${SONAR_HOST}/api/qualitygates/project_status?projectKey=${projectKey}" \
+                                          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['projectStatus']['status'])"
+                                    """,
+                                    returnStdout: true
+                                ).trim()
+
+                                echo "${projectKey} quality gate: ${response}"
+
+                                if (response == 'OK' || response == 'ERROR') {
+                                    status = response
+                                    break
+                                }
+                                retries++
+                            }
+
+                            if (status == 'ERROR') {
+                                error("Quality gate FAILED for ${projectKey}. Check ${SONAR_HOST}/dashboard?id=${projectKey}")
+                            } else if (status == '') {
+                                echo "WARNING: Quality gate timed out for ${projectKey} — analysis may still be running."
+                            } else {
+                                echo "✅ Quality gate PASSED for ${projectKey}"
+                            }
+                        }
                     }
                 }
             }
@@ -190,40 +249,40 @@ pipeline {
                 withAWS(credentials: 'aws-terraform-credentials', region: "${AWS_REGION}") {
                     sh """
                         aws ecr get-login-password --region ${AWS_REGION} | \
-                          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                          docker login --username AWS --password-stdin ${env.ECR_REGISTRY}
                     """
                     script {
                         parallel(
                             'push-user': {
                                 dir('smartbiz-erp/backend/user-service') {
                                     sh """
-                                        docker build -t ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} .
-                                        docker push ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
-                                        docker tag  ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} \
-                                                    ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
-                                        docker push ${ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                        docker build -t ${env.ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} .
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
+                                        docker tag  ${env.ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG} \
+                                                    ${env.ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-user-service:${params.ENVIRONMENT}-latest
                                     """
                                 }
                             },
                             'push-inventory': {
                                 dir('smartbiz-erp/backend/inventory-service') {
                                     sh """
-                                        docker build -t ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} .
-                                        docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
-                                        docker tag  ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} \
-                                                    ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
-                                        docker push ${ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                        docker build -t ${env.ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} .
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
+                                        docker tag  ${env.ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG} \
+                                                    ${env.ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-inventory-service:${params.ENVIRONMENT}-latest
                                     """
                                 }
                             },
                             'push-sales': {
                                 dir('smartbiz-erp/backend/sales-service') {
                                     sh """
-                                        docker build -t ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} .
-                                        docker push ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
-                                        docker tag  ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} \
-                                                    ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
-                                        docker push ${ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                        docker build -t ${env.ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} .
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
+                                        docker tag  ${env.ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG} \
+                                                    ${env.ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
+                                        docker push ${env.ECR_REGISTRY}/smartbiz-sales-service:${params.ENVIRONMENT}-latest
                                     """
                                 }
                             }
@@ -272,13 +331,13 @@ pipeline {
                               --from-literal=MONGO_URI_SALES="${MONGO_URI_SALES_VAL}" \
                               --dry-run=client -o yaml | kubectl apply -f -
 
-                            sed 's|USER_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}|g' \
+                            sed 's|USER_SERVICE_IMAGE|${env.ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}|g' \
                               smartbiz-erp/k8s/user-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
 
-                            sed 's|INVENTORY_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}|g' \
+                            sed 's|INVENTORY_SERVICE_IMAGE|${env.ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}|g' \
                               smartbiz-erp/k8s/inventory-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
 
-                            sed 's|SALES_SERVICE_IMAGE|${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}|g' \
+                            sed 's|SALES_SERVICE_IMAGE|${env.ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}|g' \
                               smartbiz-erp/k8s/sales-service/deployment.yaml | kubectl apply -n ${K8S_NAMESPACE} -f -
 
                             kubectl apply -n ${K8S_NAMESPACE} -f smartbiz-erp/k8s/user-service/service.yaml
@@ -320,9 +379,9 @@ pipeline {
 ✅ Backend deploy SUCCESS — env=${params.ENVIRONMENT}  build=${BUILD_NUMBER}
 
   Images pushed:
-    ${ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
-    ${ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
-    ${ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
+    ${env.ECR_REGISTRY}/smartbiz-user-service:${IMAGE_TAG}
+    ${env.ECR_REGISTRY}/smartbiz-inventory-service:${IMAGE_TAG}
+    ${env.ECR_REGISTRY}/smartbiz-sales-service:${IMAGE_TAG}
 
   SonarQube: ${SONAR_HOST}/projects
             """

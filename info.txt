@@ -48,3 +48,12 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   --set serviceAccount.create=false \
   --set serviceAccount.name=aws-load-balancer-controller \
   --version 1.14.0
+
+
+  curl -X GET \
+  "http://k8s-smartbiz-smartbiz-461642b91c-1373183013.us-east-1.elb.amazonaws.com/api/products/3" \
+  -H "Authorization: Bearer 8ySPPbcdiVx8YzoUR7WNtpmMpu9CC00bxout86hEiI4=" \
+  -H "Accept: application/json"
+
+
+  curl -X GET "http://k8s-smartbiz-smartbiz-461642b91c-1373183013.us-east-1.elb.amazonaws.com/api/products/3" -H "Authorization: Bearer 8ySPPbcdiVx8YzoUR7WNtpmMpu9CC00bxout86hEiI4=" -H "Accept: application/json"
