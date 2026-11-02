@@ -9,7 +9,7 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 
 @Service
-public class CustomerService {
+public class CustomerService implements CustomerServiceInterface {
 
     private final CustomerRepository customerRepository;
 

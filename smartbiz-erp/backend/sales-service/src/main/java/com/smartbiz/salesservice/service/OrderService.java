@@ -1,6 +1,7 @@
 package com.smartbiz.salesservice.service;
 
 import com.smartbiz.salesservice.client.InventoryClientInterface;
+import com.smartbiz.salesservice.service.CustomerServiceInterface;
 import com.smartbiz.salesservice.exception.ResourceNotFoundException;
 import com.smartbiz.salesservice.model.Order;
 import com.smartbiz.salesservice.model.OrderItem;
@@ -13,11 +14,11 @@ import java.util.List;
 public class OrderService {
 
     private final OrderRepository orderRepository;
-    private final CustomerService customerService;
+    private final CustomerServiceInterface customerService;
     private final InventoryClientInterface inventoryClient;
 
     public OrderService(OrderRepository orderRepository,
-                        CustomerService customerService,
+                        CustomerServiceInterface customerService,
                         InventoryClientInterface inventoryClient) {
         this.orderRepository = orderRepository;
         this.customerService = customerService;

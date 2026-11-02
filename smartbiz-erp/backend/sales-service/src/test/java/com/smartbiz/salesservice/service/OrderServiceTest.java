@@ -1,6 +1,7 @@
 package com.smartbiz.salesservice.service;
 
 import com.smartbiz.salesservice.client.InventoryClientInterface;
+import com.smartbiz.salesservice.service.CustomerServiceInterface;
 import com.smartbiz.salesservice.model.Customer;
 import com.smartbiz.salesservice.model.Order;
 import com.smartbiz.salesservice.model.OrderItem;
@@ -23,9 +24,7 @@ import static org.mockito.Mockito.*;
 class OrderServiceTest {
 
     @Mock OrderRepository orderRepository;
-    @Mock CustomerService customerService;
-    // Mock the interface — Mockito proxies interfaces without Byte Buddy instrumentation
-    // so this works on Java 23+/25 without -Dnet.bytebuddy.experimental
+    @Mock CustomerServiceInterface customerService;
     @Mock InventoryClientInterface inventoryClient;
     @InjectMocks OrderService orderService;
 
