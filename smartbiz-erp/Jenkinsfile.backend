@@ -68,7 +68,7 @@ pipeline {
                     }
                 }
 
-                git branch: 'main', url: "${GIT_REPO}"
+                git branch: 'dev', url: "${GIT_REPO}"
                 sh 'ls -la smartbiz-erp/backend/'
             }
         }
