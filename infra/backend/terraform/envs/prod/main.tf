@@ -18,8 +18,7 @@ terraform {
     bucket         = "terraform-state-erp-project"   # change to your bucket name
     key            = "eks/prod/terraform.tfstate"
     region         = "us-east-1"
-    dynamodb_table = "terraform-locks"
-    use_lockfile   = true
+    use_lockfile    = true
     encrypt        = true
   }
 }

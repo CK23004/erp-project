@@ -12,7 +12,7 @@ terraform {
     bucket         = "terraform-state-erp-project"
     key            = "frontend/prod/terraform.tfstate"
     region         = "us-east-1"
-    dynamodb_table = "terraform-locks"
+    use_lockfile    = true
     encrypt        = true
   }
 }
