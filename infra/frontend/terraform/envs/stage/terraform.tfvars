@@ -3,7 +3,7 @@
 
 aws_region        = "us-east-1"
 environment       = "stage"
-bucket_name       = "erp-frontend-stage"
+bucket_name       = "smartbiz-frontend-stage-200774432801"
 
 # ── No-domain mode (default) ──────────────────────────────────────────────
 use_custom_domain = false

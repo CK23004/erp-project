@@ -44,7 +44,7 @@ pipeline {
     environment {
         AWS_REGION      = "us-east-1"
         // S3 bucket names match what the infra/frontend terraform creates
-        S3_BUCKET       = "erp-frontend-${params.ENVIRONMENT}"
+        S3_BUCKET       = "smartbiz-frontend-${params.ENVIRONMENT}-200774432801"
         FRONTEND_DIR    = "smartbiz-erp/frontend"
         GIT_REPO        = "https://github.com/CK23004/erp-project.git"
     }

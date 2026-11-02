@@ -4,7 +4,7 @@
 
 aws_region        = "us-east-1"
 environment       = "prod"
-bucket_name       = "erp-frontend-prod"
+bucket_name       = "smartbiz-frontend-prod-200774432801"
 
 # ── No-domain mode (default) ──────────────────────────────────────────────
 use_custom_domain = false

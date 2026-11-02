@@ -9,7 +9,7 @@
 
 aws_region        = "us-east-1"
 environment       = "dev"
-bucket_name       = "erp-frontend-dev"   # must be globally unique in S3
+bucket_name       = "smartbiz-frontend-dev-200774432801"   # account ID suffix guarantees global uniqueness
 
 # ── No-domain mode (default) ──────────────────────────────────────────────
 use_custom_domain = false

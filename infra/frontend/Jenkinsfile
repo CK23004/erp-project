@@ -30,7 +30,7 @@ pipeline {
 
     environment {
         // Resolves to e.g. terraform/envs/dev
-        TF_DIR     = "terraform/envs/${params.ENVIRONMENT}"
+        TF_DIR     = "infra/frontend/terraform/envs/${params.ENVIRONMENT}"
         AWS_REGION = "us-east-1"
     }
 
@@ -40,7 +40,7 @@ pipeline {
         stage('Pull') {
             steps {
                 echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} action=${params.ACTION} ====="
-                git branch: 'main',
+                git branch: 'dev',
                     url: 'https://github.com/CK23004/erp-project.git'
                 sh "ls -la infra/frontend/${TF_DIR}/"
             }
