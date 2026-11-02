@@ -129,6 +129,20 @@
                 </executions>
             </plugin>
 
+            <!-- Surefire — enable Byte Buddy on Java 23+ and disable Datadog agent conflict -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>
+                        @{argLine}
+                        -Dnet.bytebuddy.experimental=true
+                        -XX:+EnableDynamicAgentLoading
+                        -Djdk.attach.allowAttachSelf=true
+                    </argLine>
+                </configuration>
+            </plugin>
+
             <!-- SonarQube -->
             <plugin>
                 <groupId>org.sonarsource.scanner.maven</groupId>

@@ -1,6 +1,6 @@
 package com.smartbiz.salesservice.service;
 
-import com.smartbiz.salesservice.client.InventoryClient;
+import com.smartbiz.salesservice.client.InventoryClientInterface;
 import com.smartbiz.salesservice.exception.ResourceNotFoundException;
 import com.smartbiz.salesservice.model.Order;
 import com.smartbiz.salesservice.model.OrderItem;
@@ -14,11 +14,11 @@ public class OrderService {
 
     private final OrderRepository orderRepository;
     private final CustomerService customerService;
-    private final InventoryClient inventoryClient;
+    private final InventoryClientInterface inventoryClient;
 
     public OrderService(OrderRepository orderRepository,
                         CustomerService customerService,
-                        InventoryClient inventoryClient) {
+                        InventoryClientInterface inventoryClient) {
         this.orderRepository = orderRepository;
         this.customerService = customerService;
         this.inventoryClient = inventoryClient;

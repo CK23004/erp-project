@@ -13,7 +13,7 @@ import java.util.Map;
  * inventory service can authenticate the call.
  */
 @Component
-public class InventoryClient {
+public class InventoryClient implements InventoryClientInterface {
 
     private final RestClient restClient;
 

@@ -6,12 +6,13 @@ import com.smartbiz.userservice.dto.LoginResponse;
 import com.smartbiz.userservice.exception.ResourceNotFoundException;
 import com.smartbiz.userservice.model.User;
 import com.smartbiz.userservice.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Optional;
 
@@ -23,8 +24,29 @@ class AuthServiceTest {
 
     @Mock UserRepository userRepository;
     @Mock PasswordEncoder passwordEncoder;
-    @Mock JwtUtil jwtUtil;
-    @InjectMocks AuthService authService;
+
+    // Use a real JwtUtil instead of mocking it.
+    // Byte Buddy (used by Mockito inline mocking) does not support Java 25 — 
+    // mocking concrete classes fails. JwtUtil has no external dependencies so
+    // using a real instance with a test secret is the correct approach.
+    private JwtUtil jwtUtil;
+
+    private AuthService authService;
+
+    // Valid 256-bit base64 key — same value as src/test/resources/application.properties
+    private static final String TEST_JWT_SECRET =
+            "dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3Itc21hcnRiaXotdW5pdC10ZXN0czEyMw==";
+
+    @BeforeEach
+    void setUp() {
+        jwtUtil = new JwtUtil();
+        // Inject the test secret and expiry via Spring's ReflectionTestUtils
+        // (mirrors what @Value injects at runtime)
+        ReflectionTestUtils.setField(jwtUtil, "secret", TEST_JWT_SECRET);
+        ReflectionTestUtils.setField(jwtUtil, "expirationMs", 86400000L);
+
+        authService = new AuthService(userRepository, passwordEncoder, jwtUtil);
+    }
 
     @Test
     void login_success() {
@@ -40,12 +62,13 @@ class AuthServiceTest {
 
         when(userRepository.findByEmail("admin@example.com")).thenReturn(Optional.of(user));
         when(passwordEncoder.matches("password", "hashed")).thenReturn(true);
-        when(jwtUtil.generateToken("admin@example.com", "ADMIN")).thenReturn("jwt-token");
 
         LoginResponse response = authService.login(req);
 
-        assertThat(response.getToken()).isEqualTo("jwt-token");
+        // Token is a real JWT — just verify it's non-null and non-empty
+        assertThat(response.getToken()).isNotBlank();
         assertThat(response.getRole()).isEqualTo("ADMIN");
+        assertThat(response.getEmail()).isEqualTo("admin@example.com");
     }
 
     @Test

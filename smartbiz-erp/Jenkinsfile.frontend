@@ -55,7 +55,7 @@ pipeline {
         stage('Pull') {
             steps {
                 echo "===== Stage 1: Pull — env=${params.ENVIRONMENT} build=${BUILD_NUMBER} ====="
-                git branch: 'main', url: "${GIT_REPO}"
+                git branch: 'dev', url: "${GIT_REPO}"
                 sh "ls -la ${FRONTEND_DIR}/"
             }
         }
