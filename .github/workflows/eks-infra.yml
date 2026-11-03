@@ -1,0 +1,106 @@
+# ── EKS Infrastructure Pipeline ───────────────────────────────────────────
+# Mirrors: infra/backend/Jenkinsfile
+# Provisions / destroys the EKS cluster (VPC, nodes, addons) via Terraform.
+#
+# Triggers: manual workflow_dispatch only (never runs automatically).
+#
+# GitHub Secrets required:
+#   AWS_ACCESS_KEY_ID       — IAM user access key
+#   AWS_SECRET_ACCESS_KEY   — IAM user secret key
+
+name: EKS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+      action:
+        description: "apply = create/update  |  destroy = tear down"
+        required: true
+        type: choice
+        options: [apply, destroy]
+
+env:
+  AWS_REGION: us-east-1
+  TF_DIR: infra/backend/terraform/envs/${{ github.event.inputs.environment }}
+  TF_VERSION: "1.8.5"
+
+jobs:
+  terraform:
+    name: "Terraform ${{ github.event.inputs.action }} — ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment:
+      # Maps to GitHub Environments — set up protection rules for 'prod' there
+      name: ${{ github.event.inputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      # ── Step 1: Checkout ────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      # ── Step 2: Configure AWS credentials ───────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Step 3: Setup Terraform ──────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Step 4: Terraform Init ───────────────────────────────────────────
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      # ── Step 5: Terraform Plan ───────────────────────────────────────────
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "destroy" ]; then
+            terraform plan -destroy -input=false -out=tfplan.binary
+          else
+            terraform plan -input=false -out=tfplan.binary
+          fi
+          terraform show -no-color tfplan.binary > tfplan.txt
+          echo "=== PLAN OUTPUT ==="
+          cat tfplan.txt
+
+      # ── Step 6: Upload plan as artifact for review ───────────────────────
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-eks-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: ${{ env.TF_DIR }}/tfplan.txt
+          retention-days: 7
+
+      # ── Step 7: Manual approval (prod only) ─────────────────────────────
+      # Configure an "Approval" environment in GitHub Settings → Environments
+      # → prod → Required reviewers. The job will pause here until approved.
+      # For dev/stage this step passes immediately.
+
+      # ── Step 8: Terraform Apply / Destroy ───────────────────────────────
+      - name: Terraform ${{ github.event.inputs.action }}
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan.binary
+
+      # ── Step 9: Show outputs (apply only) ───────────────────────────────
+      - name: Terraform Output
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform output

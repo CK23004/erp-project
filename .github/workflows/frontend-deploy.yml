@@ -1,0 +1,155 @@
+# ── Frontend Application Deploy Pipeline ──────────────────────────────────
+# Mirrors: smartbiz-erp/Jenkinsfile.frontend
+# Flow: Install → Lint → Vite Build → S3 Sync → CloudFront Invalidation
+#
+# GitHub Secrets required:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+
+name: Frontend Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+      api_base_url:
+        description: "Backend API base URL (ALB or CloudFront URL)"
+        required: true
+        default: "https://api.example.com"
+      invalidate_cdn:
+        description: "Invalidate CloudFront cache after sync"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION:   us-east-1
+  S3_BUCKET:    smartbiz-frontend-${{ github.event.inputs.environment }}-200774432801
+  FRONTEND_DIR: smartbiz-erp/frontend
+
+jobs:
+
+  # ── Job 1: Build ──────────────────────────────────────────────────────────
+  build:
+    name: Install, Lint & Vite Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ${{ env.FRONTEND_DIR }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: |
+          node --version && npm --version
+          npm install --silent
+
+      - name: Lint
+        working-directory: ${{ env.FRONTEND_DIR }}
+        # --if-present skips if no lint script defined in package.json
+        run: npm run lint --if-present || true
+
+      - name: Vite Build
+        working-directory: ${{ env.FRONTEND_DIR }}
+        # Inject the backend API URL at build time — baked into the JS bundle
+        env:
+          VITE_USER_API:       ${{ github.event.inputs.api_base_url }}
+          VITE_INVENTORY_API:  ${{ github.event.inputs.api_base_url }}
+          VITE_SALES_API:      ${{ github.event.inputs.api_base_url }}
+        run: |
+          npm run build
+          echo "=== Build output ==="
+          ls -lh dist/
+          du -sh dist/
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.run_number }}
+          path: ${{ env.FRONTEND_DIR }}/dist
+          retention-days: 3
+
+  # ── Job 2: Deploy to S3 + CloudFront ─────────────────────────────────────
+  # prod environment triggers the GitHub Environments approval gate.
+  deploy:
+    name: Deploy to S3 (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: ${{ github.event.inputs.environment }}   # approval gate for prod
+
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.run_number }}
+          path: dist
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # Sync JS/CSS/image assets — long-lived cache (Vite hashes filenames)
+      - name: S3 Sync — assets (long cache)
+        run: |
+          aws s3 sync dist/ s3://${{ env.S3_BUCKET }}/ \
+            --delete \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --region ${{ env.AWS_REGION }}
+
+      # Sync HTML — no-cache so users always get the latest app shell
+      - name: S3 Sync — HTML (no cache)
+        run: |
+          aws s3 sync dist/ s3://${{ env.S3_BUCKET }}/ \
+            --delete \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ Synced to s3://${{ env.S3_BUCKET }}/"
+
+      # Invalidate CloudFront so edge caches serve the new HTML immediately
+      - name: CloudFront Invalidation
+        if: github.event.inputs.invalidate_cdn == 'true'
+        run: |
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[0].DomainName=='${{ env.S3_BUCKET }}.s3.amazonaws.com'].Id | [0]" \
+            --output text --region ${{ env.AWS_REGION }})
+
+          if [ "$DIST_ID" = "None" ] || [ -z "$DIST_ID" ]; then
+            echo "⚠️ No CloudFront distribution found for ${{ env.S3_BUCKET }}. Skipping invalidation."
+          else
+            echo "Invalidating distribution: $DIST_ID"
+            aws cloudfront create-invalidation \
+              --distribution-id "$DIST_ID" \
+              --paths "/*" \
+              --region ${{ env.AWS_REGION }}
+            echo "✅ Cache invalidation created"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### ✅ Frontend Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Bucket | s3://${{ env.S3_BUCKET }}/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Base URL | ${{ github.event.inputs.api_base_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY

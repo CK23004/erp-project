@@ -1,0 +1,89 @@
+# ── Frontend Infrastructure Pipeline ──────────────────────────────────────
+# Mirrors: infra/frontend/Jenkinsfile
+# Provisions / destroys S3 + CloudFront via Terraform.
+#
+# GitHub Secrets required:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+
+name: Frontend Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+      action:
+        description: "apply = create/update  |  destroy = tear down"
+        required: true
+        type: choice
+        options: [apply, destroy]
+
+env:
+  AWS_REGION: us-east-1
+  TF_DIR: infra/frontend/terraform/envs/${{ github.event.inputs.environment }}
+  TF_VERSION: "1.8.5"
+
+jobs:
+  terraform:
+    name: "Terraform ${{ github.event.inputs.action }} — frontend ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "destroy" ]; then
+            terraform plan -destroy -input=false -out=tfplan.binary
+          else
+            terraform plan -input=false -out=tfplan.binary
+          fi
+          terraform show -no-color tfplan.binary > tfplan.txt
+          echo "=== PLAN OUTPUT ==="
+          cat tfplan.txt
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-frontend-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: ${{ env.TF_DIR }}/tfplan.txt
+          retention-days: 7
+
+      - name: Terraform ${{ github.event.inputs.action }}
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan.binary
+
+      - name: Terraform Output
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform output
