@@ -1,6 +1,6 @@
 # ── Frontend Infrastructure Pipeline ──────────────────────────────────────
 # Mirrors: infra/frontend/Jenkinsfile
-# Provisions / destroys S3 + CloudFront via Terraform.
+# Runs on your LOCAL machine as a self-hosted GitHub Actions runner.
 #
 # GitHub Secrets required:
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
@@ -23,38 +23,27 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  TF_DIR: infra/frontend/terraform/envs/${{ github.event.inputs.environment }}
-  TF_VERSION: "1.8.5"
+  TF_DIR:     infra/frontend/terraform/envs/${{ github.event.inputs.environment }}
 
 jobs:
   terraform:
-    name: "Terraform ${{ github.event.inputs.action }} — frontend ${{ github.event.inputs.environment }}"
-    runs-on: ubuntu-latest
+    name: "Terraform ${{ github.event.inputs.action }} — Frontend ${{ github.event.inputs.environment }}"
+    runs-on: self-hosted
     environment:
       name: ${{ github.event.inputs.environment }}
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: dev
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
+      - name: Set AWS credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ env.AWS_REGION }}" >> $GITHUB_ENV
 
       - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
@@ -69,8 +58,7 @@ jobs:
             terraform plan -input=false -out=tfplan.binary
           fi
           terraform show -no-color tfplan.binary > tfplan.txt
-          echo "=== PLAN OUTPUT ==="
-          cat tfplan.txt
+          echo "=== PLAN OUTPUT ===" && cat tfplan.txt
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
@@ -87,3 +75,8 @@ jobs:
         if: github.event.inputs.action == 'apply'
         working-directory: ${{ env.TF_DIR }}
         run: terraform output
+
+      - name: Cleanup
+        if: always()
+        working-directory: ${{ env.TF_DIR }}
+        run: rm -f tfplan.binary tfplan.txt

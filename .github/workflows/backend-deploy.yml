@@ -1,18 +1,17 @@
 # ── Backend Application Deploy Pipeline ───────────────────────────────────
 # Mirrors: smartbiz-erp/Jenkinsfile.backend
+# Runs on your LOCAL machine as a self-hosted runner.
+# Uses locally installed: Java 25, Maven, Docker, AWS CLI, kubectl
+#
 # Flow: Test → SonarQube → Build JARs → Docker Build+Push ECR → Deploy EKS → Verify
 #
 # GitHub Secrets required (Settings → Secrets → Actions):
-#   AWS_ACCESS_KEY_ID       — IAM user access key
-#   AWS_SECRET_ACCESS_KEY   — IAM user secret key
-#   SONAR_TOKEN             — SonarQube user token
-#   JWT_SECRET              — JWT signing key (base64 256-bit)
-#   MONGO_URI_USERS         — Atlas/local MongoDB URI for smartbiz_users
-#   MONGO_URI_INVENTORY     — Atlas/local MongoDB URI for smartbiz_inventory
-#   MONGO_URI_SALES         — Atlas/local MongoDB URI for smartbiz_sales
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   SONAR_TOKEN, JWT_SECRET
+#   MONGO_URI_USERS, MONGO_URI_INVENTORY, MONGO_URI_SALES
 #
 # GitHub Environments (Settings → Environments):
-#   prod — add Required Reviewers for the approval gate
+#   prod — add Required Reviewers for the manual approval gate
 
 name: Backend Deploy
 
@@ -26,12 +25,10 @@ on:
         options: [dev, stage, prod]
       skip_tests:
         description: "Skip unit tests (emergencies only)"
-        required: false
         type: boolean
         default: false
       skip_sonar:
         description: "Skip SonarQube analysis"
-        required: false
         type: boolean
         default: false
 
@@ -39,19 +36,16 @@ env:
   AWS_REGION:    us-east-1
   K8S_NAMESPACE: smartbiz
   IMAGE_TAG:     ${{ github.event.inputs.environment }}-${{ github.run_number }}
-  SONAR_HOST:    http://localhost:9000   # change to your SonarQube URL
+  SONAR_HOST:    http://localhost:9000
+  EKS_CLUSTER:   eks-${{ github.event.inputs.environment }}
 
 jobs:
 
-  # ── Job 1: Test (parallel services) ──────────────────────────────────────
+  # ── Job 1: Tests ───────────────────────────────────────────────────────
   test:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     if: ${{ github.event.inputs.skip_tests != 'true' }}
-    strategy:
-      matrix:
-        service: [user-service, inventory-service, sales-service]
-      fail-fast: false   # run all three even if one fails
 
     steps:
       - name: Checkout
@@ -59,62 +53,60 @@ jobs:
         with:
           ref: dev
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: temurin
-          cache: maven
-
-      - name: Run tests — ${{ matrix.service }}
+      # Tests run in parallel via separate steps — matrix not needed since
+      # it's the same machine. Each service is independent.
+      - name: Test — user-service
         run: |
-          cd smartbiz-erp/backend/${{ matrix.service }}
-          mvn clean verify -B -q \
-            -Dspring.data.mongodb.database=smartbiz_${{ matrix.service }}_test
+          cd smartbiz-erp/backend/user-service
+          mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_users_test
 
-      - name: Publish test results
+      - name: Test — inventory-service
+        run: |
+          cd smartbiz-erp/backend/inventory-service
+          mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_inventory_test
+
+      - name: Test — sales-service
+        run: |
+          cd smartbiz-erp/backend/sales-service
+          mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_sales_test
+
+      - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-${{ matrix.service }}
-          path: smartbiz-erp/backend/${{ matrix.service }}/target/surefire-reports/*.xml
+          name: test-results-${{ github.run_number }}
+          path: |
+            smartbiz-erp/backend/user-service/target/surefire-reports/*.xml
+            smartbiz-erp/backend/inventory-service/target/surefire-reports/*.xml
+            smartbiz-erp/backend/sales-service/target/surefire-reports/*.xml
           retention-days: 7
 
-  # ── Job 2: SonarQube Analysis ─────────────────────────────────────────────
+  # ── Job 2: SonarQube Analysis ─────────────────────────────────────────
   sonar:
     name: SonarQube Analysis
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: test
     if: ${{ github.event.inputs.skip_sonar != 'true' && always() && needs.test.result != 'failure' }}
-    strategy:
-      matrix:
-        service: [user-service, inventory-service, sales-service]
-      fail-fast: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: dev
-          fetch-depth: 0   # full history needed for accurate SonarQube blame
+          fetch-depth: 0
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: temurin
-          cache: maven
-
-      # Run verify first to generate JaCoCo coverage report for SonarQube
-      - name: Build with coverage — ${{ matrix.service }}
+      # Run verify first to get JaCoCo coverage report for SonarQube
+      - name: Build with coverage
         run: |
-          cd smartbiz-erp/backend/${{ matrix.service }}
-          mvn clean verify -B -q \
-            -Dspring.data.mongodb.database=smartbiz_test
+          for svc in user-service inventory-service sales-service; do
+            cd smartbiz-erp/backend/$svc
+            mvn clean verify -B -q -Dspring.data.mongodb.database=smartbiz_test
+            cd ../../..
+          done
 
-      - name: SonarQube scan — ${{ matrix.service }}
+      - name: SonarQube scan — user-service
         run: |
-          cd smartbiz-erp/backend/${{ matrix.service }}
+          cd smartbiz-erp/backend/user-service
           mvn sonar:sonar -B -q \
             -Dsonar.host.url=${{ env.SONAR_HOST }} \
             -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
@@ -122,35 +114,51 @@ jobs:
             -Dsonar.sources=src/main/java \
             -Dsonar.tests=src/test/java
 
-      # Poll SonarQube quality gate via REST API — no webhook needed
+      - name: SonarQube scan — inventory-service
+        run: |
+          cd smartbiz-erp/backend/inventory-service
+          mvn sonar:sonar -B -q \
+            -Dsonar.host.url=${{ env.SONAR_HOST }} \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.projectKey=smartbiz-erp \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java
+
+      - name: SonarQube scan — sales-service
+        run: |
+          cd smartbiz-erp/backend/sales-service
+          mvn sonar:sonar -B -q \
+            -Dsonar.host.url=${{ env.SONAR_HOST }} \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.projectKey=smartbiz-erp \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java
+
+      # Poll SonarQube REST API — no webhook needed (works behind NAT)
       - name: Check quality gate
         run: |
-          echo "Waiting for SonarQube analysis to complete..."
+          echo "Polling SonarQube quality gate..."
           STATUS=""
           for i in $(seq 1 24); do
             sleep 5
             STATUS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
               "${{ env.SONAR_HOST }}/api/qualitygates/project_status?projectKey=smartbiz-erp" \
               | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "PENDING")
-            echo "Quality gate status: $STATUS"
-            if [ "$STATUS" = "OK" ] || [ "$STATUS" = "ERROR" ]; then
-              break
-            fi
+            echo "Attempt $i — status: $STATUS"
+            if [ "$STATUS" = "OK" ] || [ "$STATUS" = "ERROR" ]; then break; fi
           done
           if [ "$STATUS" = "ERROR" ]; then
             echo "❌ Quality gate FAILED"
             exit 1
           fi
-          echo "✅ Quality gate PASSED (or timed out — check SonarQube UI)"
+          echo "✅ Quality gate: $STATUS"
 
-  # ── Job 3: Build & Push Docker images to ECR ──────────────────────────────
+  # ── Job 3: Build JARs + Docker images + Push to ECR ───────────────────
   build-push:
-    name: Build & Push ECR
-    runs-on: ubuntu-latest
+    name: Build & Push to ECR
+    runs-on: self-hosted
     needs: [test, sonar]
     if: always() && needs.test.result != 'failure' && needs.sonar.result != 'failure'
-    outputs:
-      ecr_registry: ${{ steps.ecr.outputs.registry }}
 
     steps:
       - name: Checkout
@@ -158,85 +166,11 @@ jobs:
         with:
           ref: dev
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: temurin
-          cache: maven
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # Build all three JARs
-      - name: Build JARs
+      - name: Set AWS credentials
         run: |
-          for svc in user-service inventory-service sales-service; do
-            echo "Building JAR: $svc"
-            cd smartbiz-erp/backend/$svc
-            mvn package -DskipTests -B -q
-            cd ../../..
-          done
-
-      # Build and push Docker images in parallel using matrix isn't possible here
-      # so we do them sequentially — still fast since builds are independent
-      - name: Build & Push — user-service
-        run: |
-          cd smartbiz-erp/backend/user-service
-          docker build -t ${{ steps.ecr.outputs.registry }}/smartbiz-user-service:${{ env.IMAGE_TAG }} .
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-user-service:${{ env.IMAGE_TAG }}
-          docker tag  ${{ steps.ecr.outputs.registry }}/smartbiz-user-service:${{ env.IMAGE_TAG }} \
-                      ${{ steps.ecr.outputs.registry }}/smartbiz-user-service:${{ github.event.inputs.environment }}-latest
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-user-service:${{ github.event.inputs.environment }}-latest
-
-      - name: Build & Push — inventory-service
-        run: |
-          cd smartbiz-erp/backend/inventory-service
-          docker build -t ${{ steps.ecr.outputs.registry }}/smartbiz-inventory-service:${{ env.IMAGE_TAG }} .
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-inventory-service:${{ env.IMAGE_TAG }}
-          docker tag  ${{ steps.ecr.outputs.registry }}/smartbiz-inventory-service:${{ env.IMAGE_TAG }} \
-                      ${{ steps.ecr.outputs.registry }}/smartbiz-inventory-service:${{ github.event.inputs.environment }}-latest
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-inventory-service:${{ github.event.inputs.environment }}-latest
-
-      - name: Build & Push — sales-service
-        run: |
-          cd smartbiz-erp/backend/sales-service
-          docker build -t ${{ steps.ecr.outputs.registry }}/smartbiz-sales-service:${{ env.IMAGE_TAG }} .
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-sales-service:${{ env.IMAGE_TAG }}
-          docker tag  ${{ steps.ecr.outputs.registry }}/smartbiz-sales-service:${{ env.IMAGE_TAG }} \
-                      ${{ steps.ecr.outputs.registry }}/smartbiz-sales-service:${{ github.event.inputs.environment }}-latest
-          docker push ${{ steps.ecr.outputs.registry }}/smartbiz-sales-service:${{ github.event.inputs.environment }}-latest
-
-  # ── Job 4: Deploy to EKS ──────────────────────────────────────────────────
-  # The 'prod' environment requires manual approval via GitHub Environments.
-  # Set up: Settings → Environments → prod → Required reviewers
-  deploy:
-    name: Deploy to EKS (${{ github.event.inputs.environment }})
-    runs-on: ubuntu-latest
-    needs: build-push
-    environment:
-      name: ${{ github.event.inputs.environment }}   # triggers approval gate for prod
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: dev
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ env.AWS_REGION }}" >> $GITHUB_ENV
 
       - name: Get ECR registry
         id: ecr
@@ -244,15 +178,89 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+      - name: ECR login
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ steps.ecr.outputs.registry }}
+
+      - name: Build JARs
+        run: |
+          for svc in user-service inventory-service sales-service; do
+            echo "Packaging $svc..."
+            cd smartbiz-erp/backend/$svc
+            mvn package -DskipTests -B -q
+            cd ../../..
+          done
+
+      - name: Docker Build & Push — user-service
+        run: |
+          REG="${{ steps.ecr.outputs.registry }}"
+          TAG="${{ env.IMAGE_TAG }}"
+          ENV="${{ github.event.inputs.environment }}"
+          cd smartbiz-erp/backend/user-service
+          docker build -t $REG/smartbiz-user-service:$TAG .
+          docker push $REG/smartbiz-user-service:$TAG
+          docker tag  $REG/smartbiz-user-service:$TAG $REG/smartbiz-user-service:$ENV-latest
+          docker push $REG/smartbiz-user-service:$ENV-latest
+
+      - name: Docker Build & Push — inventory-service
+        run: |
+          REG="${{ steps.ecr.outputs.registry }}"
+          TAG="${{ env.IMAGE_TAG }}"
+          ENV="${{ github.event.inputs.environment }}"
+          cd smartbiz-erp/backend/inventory-service
+          docker build -t $REG/smartbiz-inventory-service:$TAG .
+          docker push $REG/smartbiz-inventory-service:$TAG
+          docker tag  $REG/smartbiz-inventory-service:$TAG $REG/smartbiz-inventory-service:$ENV-latest
+          docker push $REG/smartbiz-inventory-service:$ENV-latest
+
+      - name: Docker Build & Push — sales-service
+        run: |
+          REG="${{ steps.ecr.outputs.registry }}"
+          TAG="${{ env.IMAGE_TAG }}"
+          ENV="${{ github.event.inputs.environment }}"
+          cd smartbiz-erp/backend/sales-service
+          docker build -t $REG/smartbiz-sales-service:$TAG .
+          docker push $REG/smartbiz-sales-service:$TAG
+          docker tag  $REG/smartbiz-sales-service:$TAG $REG/smartbiz-sales-service:$ENV-latest
+          docker push $REG/smartbiz-sales-service:$ENV-latest
+
+      - name: Cleanup Docker images
+        if: always()
+        run: docker image prune -f || true
+
+  # ── Job 4: Deploy to EKS ──────────────────────────────────────────────
+  # prod environment triggers the GitHub Environments approval gate.
+  # Set up: Settings → Environments → prod → Required reviewers
+  deploy:
+    name: Deploy to EKS (${{ github.event.inputs.environment }})
+    runs-on: self-hosted
+    needs: build-push
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          version: 'v1.29.0'
+          ref: dev
+
+      - name: Set AWS credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Get ECR registry
+        id: ecr
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
 
       - name: Configure kubectl
         run: |
           aws eks update-kubeconfig \
-            --name eks-${{ github.event.inputs.environment }} \
+            --name ${{ env.EKS_CLUSTER }} \
             --region ${{ env.AWS_REGION }}
 
       - name: Apply namespace
@@ -268,19 +276,19 @@ jobs:
             --from-literal=MONGO_URI_SALES="${{ secrets.MONGO_URI_SALES }}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Deploy services
+      - name: Deploy to EKS
         run: |
-          ECR="${{ steps.ecr.outputs.registry }}"
+          REG="${{ steps.ecr.outputs.registry }}"
           TAG="${{ env.IMAGE_TAG }}"
           NS="${{ env.K8S_NAMESPACE }}"
 
-          sed "s|USER_SERVICE_IMAGE|${ECR}/smartbiz-user-service:${TAG}|g" \
+          sed "s|USER_SERVICE_IMAGE|${REG}/smartbiz-user-service:${TAG}|g" \
             smartbiz-erp/k8s/user-service/deployment.yaml | kubectl apply -n $NS -f -
 
-          sed "s|INVENTORY_SERVICE_IMAGE|${ECR}/smartbiz-inventory-service:${TAG}|g" \
+          sed "s|INVENTORY_SERVICE_IMAGE|${REG}/smartbiz-inventory-service:${TAG}|g" \
             smartbiz-erp/k8s/inventory-service/deployment.yaml | kubectl apply -n $NS -f -
 
-          sed "s|SALES_SERVICE_IMAGE|${ECR}/smartbiz-sales-service:${TAG}|g" \
+          sed "s|SALES_SERVICE_IMAGE|${REG}/smartbiz-sales-service:${TAG}|g" \
             smartbiz-erp/k8s/sales-service/deployment.yaml | kubectl apply -n $NS -f -
 
           kubectl apply -n $NS -f smartbiz-erp/k8s/user-service/service.yaml
@@ -294,7 +302,5 @@ jobs:
           kubectl rollout status deployment/user-service      -n $NS --timeout=180s
           kubectl rollout status deployment/inventory-service -n $NS --timeout=180s
           kubectl rollout status deployment/sales-service     -n $NS --timeout=180s
-          echo "=== Pods ==="
-          kubectl get pods -n $NS
-          echo "=== Ingress ==="
-          kubectl get ingress -n $NS
+          echo "=== Pods ===" && kubectl get pods -n $NS
+          echo "=== Ingress ===" && kubectl get ingress -n $NS

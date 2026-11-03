@@ -4,7 +4,7 @@
 # State is isolated under  eks/stage/terraform.tfstate  in the same S3 bucket.
 
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.10"
 
   required_providers {
     aws = {

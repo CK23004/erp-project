@@ -12,7 +12,7 @@
 #     → Requires: domain_name, hosted_zone_id set in terraform.tfvars
 
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.10"
   required_providers {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
